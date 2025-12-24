@@ -17,9 +17,6 @@ env/
 .scenario_state.json
 .scenario_stop
 
-# Model weights (too large for git)
-*.pth
-
 # Logs
 *.log
 
