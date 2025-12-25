@@ -83,16 +83,24 @@ SCENARIO_CONFIGS = {
     },
     Scenario.LUNCH_RUSH: {
         "name": "Lunch Rush Scenario",
-        "description": "Classic bank pattern with predictable lunch peak",
-        "duration": 3.0,
+        "description": "Classic bank pattern: morning quiet → 12-2pm lunch rush → afternoon quiet",
+        "duration": 6.0,  # Full day from 9am to 3pm
         "initial_tellers": 3,
         "schedule": [
-            {"start": 0, "end": 30, "rate": 15},
-            {"start": 30, "end": 60, "rate": 30},
-            {"start": 60, "end": 90, "rate": 60},
-            {"start": 90, "end": 120, "rate": 90},
-            {"start": 120, "end": 150, "rate": 50},
-            {"start": 150, "end": 180, "rate": 20},
+            # 09:00-10:00: Early morning - light traffic
+            {"start": 0, "end": 60, "rate": 15},
+            # 10:00-11:00: Mid-morning - moderate
+            {"start": 60, "end": 120, "rate": 25},
+            # 11:00-12:00: Pre-lunch buildup
+            {"start": 120, "end": 180, "rate": 40},
+            # 12:00-12:30: Lunch rush begins
+            {"start": 180, "end": 210, "rate": 80},
+            # 12:30-13:30: PEAK LUNCH RUSH
+            {"start": 210, "end": 270, "rate": 120},
+            # 13:30-14:00: Rush subsiding
+            {"start": 270, "end": 300, "rate": 70},
+            # 14:00-15:00: Afternoon quiet
+            {"start": 300, "end": 360, "rate": 20},
         ]
     },
     Scenario.PAYDAY: {
