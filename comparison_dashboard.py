@@ -45,8 +45,8 @@ SCENARIO_CONFIGS = {
         "name": "Flash Mob",
         "description": "Sudden rush: 20/hr → 200/hr → 15/hr",
         "duration": 2.0,
-        "fixed_tellers": 8,  # Traditional approach: fixed count
-        "initial_tellers": 3,  # Dynamic approach: starts low
+        "fixed_tellers": 12,  # Traditional: overstaffed for "just in case"
+        "initial_tellers": 5,  # Dynamic: starts moderate, scales as needed
         "schedule": [
             {"start": 0, "end": 20, "rate": 20},
             {"start": 20, "end": 25, "rate": 50},
@@ -60,8 +60,8 @@ SCENARIO_CONFIGS = {
         "name": "Lunch Rush",
         "description": "12-2pm peak: 15/hr → 120/hr → 20/hr",
         "duration": 6.0,
-        "fixed_tellers": 10,
-        "initial_tellers": 3,
+        "fixed_tellers": 15,  # Traditional: overstaffed all day
+        "initial_tellers": 4,  # Dynamic: starts lean
         "schedule": [
             {"start": 0, "end": 60, "rate": 15},
             {"start": 60, "end": 120, "rate": 25},
@@ -76,8 +76,8 @@ SCENARIO_CONFIGS = {
         "name": "Payday",
         "description": "Sustained high: 40-100/hr all day",
         "duration": 2.5,
-        "fixed_tellers": 12,
-        "initial_tellers": 5,
+        "fixed_tellers": 15,  # Traditional: overstaffed
+        "initial_tellers": 6,  # Dynamic: starts moderate
         "schedule": [
             {"start": 0, "end": 15, "rate": 40},
             {"start": 15, "end": 45, "rate": 80},
@@ -90,8 +90,8 @@ SCENARIO_CONFIGS = {
         "name": "Stress Test",
         "description": "Extreme oscillations: 20↔200/hr",
         "duration": 2.0,
-        "fixed_tellers": 15,
-        "initial_tellers": 3,
+        "fixed_tellers": 18,  # Traditional: heavily overstaffed
+        "initial_tellers": 5,  # Dynamic: adapts to oscillations
         "schedule": [
             {"start": 0, "end": 10, "rate": 20},
             {"start": 10, "end": 20, "rate": 150},

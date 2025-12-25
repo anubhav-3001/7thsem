@@ -59,17 +59,17 @@ logger = logging.getLogger(__name__)
 W_REF = 5.0  # Reference wait time (minutes)
 
 # Cost weights (tunable hyperparameters)
-# Balanced for cost efficiency while maintaining good service
-C_LABOR = 5.0       # Increased from 2 - more cost-conscious
+# Balanced for service quality and cost efficiency
+C_LABOR = 3.0       # Moderate labor cost
 C_WAIT = 20.0       # Balanced wait cost
 C_BURNOUT = 50.0    # Cost per burnt-out teller (highest!)
 
-# Emergency thresholds - raised to reduce over-scaling
-QUEUE_EMERGENCY_THRESHOLD = 15  # Force ADD_TELLER only above this (was 10)
-QUEUE_HIGH_THRESHOLD = 10       # Consider adding teller (was 6)
+# Emergency thresholds - balanced for responsiveness
+QUEUE_EMERGENCY_THRESHOLD = 8   # Force ADD_TELLER above this (quick response)
+QUEUE_HIGH_THRESHOLD = 5        # Start considering adding teller
 
 # Decision interval
-DECISION_INTERVAL_MINUTES = 2.0  # Reduced from 5 for faster response
+DECISION_INTERVAL_MINUTES = 2.0  # Fast response
 
 # Fluid approximation parameters
 MU_SERVICE = 1.0 / 3.0  # Service rate (customers/minute)
