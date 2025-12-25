@@ -115,14 +115,17 @@ def get_default_state(system_type: str):
         'anger_levels': [],
         'served_counts': [],
         'reneged_counts': [],
+        'wait_times': [],  # Average wait time per interval
         'current_time': '09:00',
         'current_queue': 0,
         'current_tellers': 0,
         'current_anger': 0.0,
+        'current_avg_wait': 0.0,
         'total_served': 0,
         'total_reneged': 0,
         'total_arrivals': 0,
         'total_labor_cost': 0.0,
+        'total_wait_time': 0.0,
         'teller_hours': 0.0,
         'is_running': False,
         'is_complete': False,
@@ -220,13 +223,19 @@ def run_traditional_simulation(scenario: Scenario, speed: float):
         data['served_counts'].append(simulation.metrics.total_served)
         data['reneged_counts'].append(simulation.metrics.total_reneged)
         
+        # Calculate average wait time
+        avg_wait = simulation.metrics.total_wait_time / max(1, simulation.metrics.total_served) if simulation.metrics.total_served > 0 else 0
+        data['wait_times'].append(avg_wait)
+        
         data['current_time'] = time_str
         data['current_queue'] = len(simulation.waiting_customers)
         data['current_tellers'] = config['fixed_tellers']
         data['current_anger'] = float(simulation.anger_tracker.current_anger)
+        data['current_avg_wait'] = avg_wait
         data['total_served'] = simulation.metrics.total_served
         data['total_reneged'] = simulation.metrics.total_reneged
         data['total_arrivals'] = simulation.metrics.total_arrivals
+        data['total_wait_time'] = simulation.metrics.total_wait_time
         
         # Calculate cost
         interval_hours = decision_interval / 60.0
@@ -358,13 +367,19 @@ def run_dynamic_simulation(scenario: Scenario, speed: float):
         data['served_counts'].append(simulation.metrics.total_served)
         data['reneged_counts'].append(simulation.metrics.total_reneged)
         
+        # Calculate average wait time
+        avg_wait = simulation.metrics.total_wait_time / max(1, simulation.metrics.total_served) if simulation.metrics.total_served > 0 else 0
+        data['wait_times'].append(avg_wait)
+        
         data['current_time'] = time_str
         data['current_queue'] = len(simulation.waiting_customers)
         data['current_tellers'] = len(simulation.tellers)
         data['current_anger'] = float(simulation.anger_tracker.current_anger)
+        data['current_avg_wait'] = avg_wait
         data['total_served'] = simulation.metrics.total_served
         data['total_reneged'] = simulation.metrics.total_reneged
         data['total_arrivals'] = simulation.metrics.total_arrivals
+        data['total_wait_time'] = simulation.metrics.total_wait_time
         
         # Calculate cost
         interval_hours = decision_interval / 60.0
@@ -504,19 +519,21 @@ def main():
     
     with col1:
         st.markdown("#### 🔴 Traditional (Fixed Tellers)")
-        c1, c2, c3, c4 = st.columns(4)
+        c1, c2, c3, c4, c5 = st.columns(5)
         c1.metric("Queue", trad_data['current_queue'])
         c2.metric("Tellers", trad_data['current_tellers'])
         c3.metric("Served", trad_data['total_served'])
-        c4.metric("Cost", f"${trad_data.get('total_labor_cost', 0):.0f}")
+        c4.metric("Wait", f"{trad_data.get('current_avg_wait', 0):.1f}m")
+        c5.metric("Cost", f"${trad_data.get('total_labor_cost', 0):.0f}")
     
     with col2:
         st.markdown("#### 🟢 Dynamic (Our Optimizer)")
-        c1, c2, c3, c4 = st.columns(4)
+        c1, c2, c3, c4, c5 = st.columns(5)
         c1.metric("Queue", dyn_data['current_queue'])
         c2.metric("Tellers", dyn_data['current_tellers'])
         c3.metric("Served", dyn_data['total_served'])
-        c4.metric("Cost", f"${dyn_data.get('total_labor_cost', 0):.0f}")
+        c4.metric("Wait", f"{dyn_data.get('current_avg_wait', 0):.1f}m")
+        c5.metric("Cost", f"${dyn_data.get('total_labor_cost', 0):.0f}")
     
     st.markdown("---")
     
@@ -539,8 +556,8 @@ def main():
     
     with col1:
         st.plotly_chart(
-            create_comparison_chart(trad_data, dyn_data, 'anger_levels', '😠 Anger Level Over Time'),
-            use_container_width=True, key="anger"
+            create_comparison_chart(trad_data, dyn_data, 'wait_times', '⏱️ Average Wait Time (min)'),
+            use_container_width=True, key="wait"
         )
     
     with col2:
@@ -563,25 +580,28 @@ def main():
             trad_cost_per_cust = trad_data['total_labor_cost'] / max(1, trad_data['total_served'])
             dyn_cost_per_cust = dyn_data['total_labor_cost'] / max(1, dyn_data['total_served'])
             
+            trad_avg_wait = trad_data.get('total_wait_time', 0) / max(1, trad_data['total_served'])
+            dyn_avg_wait = dyn_data.get('total_wait_time', 0) / max(1, dyn_data['total_served'])
+            
             comparison_data = {
-                'Metric': ['Total Served', 'Total Reneged', 'Service Rate', 'Total Cost', 'Cost/Customer', 'Peak Tellers', 'Teller Hours'],
+                'Metric': ['Total Served', 'Total Reneged', 'Service Rate', 'Avg Wait Time', 'Total Cost', 'Cost/Customer', 'Peak Tellers'],
                 'Traditional': [
                     trad_data['total_served'],
                     trad_data['total_reneged'],
                     f"{trad_service_rate:.1f}%",
+                    f"{trad_avg_wait:.1f} min",
                     f"${trad_data['total_labor_cost']:.0f}",
                     f"${trad_cost_per_cust:.2f}",
                     max(trad_data['teller_counts']) if trad_data['teller_counts'] else 0,
-                    f"{trad_data['teller_hours']:.1f}"
                 ],
                 'Dynamic (Ours)': [
                     dyn_data['total_served'],
                     dyn_data['total_reneged'],
                     f"{dyn_service_rate:.1f}%",
+                    f"{dyn_avg_wait:.1f} min",
                     f"${dyn_data['total_labor_cost']:.0f}",
                     f"${dyn_cost_per_cust:.2f}",
                     max(dyn_data['teller_counts']) if dyn_data['teller_counts'] else 0,
-                    f"{dyn_data['teller_hours']:.1f}"
                 ],
                 'Winner': []
             }
@@ -594,14 +614,14 @@ def main():
             winners.append('🟢 Dynamic' if dyn_data['total_reneged'] < trad_data['total_reneged'] else '🔴 Traditional' if trad_data['total_reneged'] < dyn_data['total_reneged'] else 'Tie')
             # Service rate - higher is better
             winners.append('🟢 Dynamic' if dyn_service_rate > trad_service_rate else '🔴 Traditional' if trad_service_rate > dyn_service_rate else 'Tie')
+            # Wait time - lower is better
+            winners.append('🟢 Dynamic' if dyn_avg_wait < trad_avg_wait else '🔴 Traditional' if trad_avg_wait < dyn_avg_wait else 'Tie')
             # Cost - lower is better
             winners.append('🟢 Dynamic' if dyn_data['total_labor_cost'] < trad_data['total_labor_cost'] else '🔴 Traditional' if trad_data['total_labor_cost'] < dyn_data['total_labor_cost'] else 'Tie')
             # Cost per customer - lower is better
             winners.append('🟢 Dynamic' if dyn_cost_per_cust < trad_cost_per_cust else '🔴 Traditional' if trad_cost_per_cust < dyn_cost_per_cust else 'Tie')
             # Peak tellers - context dependent
             winners.append('N/A')
-            # Teller hours - lower is better
-            winners.append('🟢 Dynamic' if dyn_data['teller_hours'] < trad_data['teller_hours'] else '🔴 Traditional' if trad_data['teller_hours'] < dyn_data['teller_hours'] else 'Tie')
             
             comparison_data['Winner'] = winners
             
