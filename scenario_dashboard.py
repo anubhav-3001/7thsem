@@ -30,14 +30,26 @@ from simulation_engine import AffectiveSimulationEngine, Customer
 from forecaster import BayesianForecaster
 from optimization_agent import OptimizationAgent, SystemState, Action
 
-# State file path
+# State file paths
 STATE_FILE = Path(__file__).parent / ".scenario_state.json"
+STATE_FILE_TRADITIONAL = Path(__file__).parent / ".scenario_state_traditional.json"
+STATE_FILE_COMPARISON = Path(__file__).parent / ".scenario_comparison.json"
 STOP_FILE = Path(__file__).parent / ".scenario_stop"
 
 # Kafka configuration
 KAFKA_BOOTSTRAP = "localhost:9092"
 KAFKA_TOPIC_SCENARIO = "scenario_events"
 KAFKA_TOPIC_DECISIONS = "scenario_decisions"
+
+# Comparison mode constants
+TRADITIONAL_TELLER_COUNTS = {
+    "Flash Mob": 8,       # Fixed at 8 tellers
+    "Lunch Rush": 6,      # Fixed at 6 tellers  
+    "Payday": 10,         # Fixed at 10 tellers
+    "Holiday Eve": 6,     # Fixed at 6 tellers
+    "Quiet Day": 4,       # Fixed at 4 tellers
+    "Stress Test": 8,     # Fixed at 8 tellers
+}
 
 
 def get_kafka_producer() -> Optional[KafkaProducer]:
@@ -215,6 +227,118 @@ def clear_stop():
     """Clear stop request"""
     if STOP_FILE.exists():
         STOP_FILE.unlink()
+
+
+def save_traditional_state(data):
+    """Save traditional simulation state to file"""
+    with open(STATE_FILE_TRADITIONAL, 'w') as f:
+        json.dump(data, f)
+
+
+def load_traditional_state():
+    """Load traditional simulation state from file"""
+    try:
+        if STATE_FILE_TRADITIONAL.exists():
+            with open(STATE_FILE_TRADITIONAL, 'r') as f:
+                return json.load(f)
+    except:
+        pass
+    return get_default_state()
+
+
+def run_traditional_thread(scenario: Scenario, speed: float = 10.0):
+    """Run traditional fixed-teller simulation for comparison"""
+    config = SCENARIO_CONFIGS[scenario]
+    fixed_tellers = TRADITIONAL_TELLER_COUNTS.get(scenario.value, 5)
+    
+    # Initialize state
+    data = get_default_state()
+    data['current_tellers'] = fixed_tellers
+    data['is_running'] = True
+    data['logs'].append(f"📊 TRADITIONAL: Fixed {fixed_tellers} tellers")
+    data['logs'].append(f"Running: {config['name']}")
+    save_traditional_state(data)
+    
+    # Clear stop flag
+    clear_stop()
+    
+    # Initialize simulation with fixed tellers
+    np.random.seed(42)
+    simulation = AffectiveSimulationEngine(
+        num_tellers=fixed_tellers,
+        seed=42
+    )
+    simulation.running = True
+    simulation.env.process(simulation._service_process())
+    simulation.env.process(simulation._anger_update_process())
+    
+    # Run simulation (NO optimizer - fixed tellers)
+    sim_time = 0.0
+    decision_interval = 2.0
+    duration_minutes = config['duration'] * 60
+    
+    def get_rate(t):
+        for period in config['schedule']:
+            if period['start'] <= t < period['end']:
+                return period['rate']
+        return 5.0
+    
+    while sim_time < duration_minutes and not should_stop():
+        current_rate = get_rate(sim_time)
+        
+        # Generate arrivals (same as dynamic)
+        expected = current_rate * (decision_interval / 60)
+        actual_arrivals = np.random.poisson(expected)
+        
+        for _ in range(actual_arrivals):
+            import uuid
+            customer = Customer(
+                customer_id=str(uuid.uuid4())[:8],
+                arrival_time=simulation.env.now,
+                patience_limit=np.random.exponential(25),
+                task_complexity=np.clip(np.random.exponential(0.8), 0.3, 2.0),
+                contagion_factor=np.random.beta(2, 8)
+            )
+            simulation.add_customer(customer)
+        
+        # Step simulation (NO decision-making - tellers stay fixed)
+        simulation.env.run(until=simulation.env.now + decision_interval)
+        
+        # Update state (teller count stays FIXED)
+        time_str = f"{int(9 + sim_time/60):02d}:{int(sim_time%60):02d}"
+        data['time_points'].append(time_str)
+        data['queue_lengths'].append(len(simulation.waiting_customers))
+        data['teller_counts'].append(fixed_tellers)  # FIXED!
+        data['anger_levels'].append(float(simulation.anger_tracker.current_anger))
+        data['arrival_rates'].append(float(current_rate))
+        data['decisions'].append("FIXED")  # No decisions
+        
+        data['current_time'] = time_str
+        data['current_queue'] = len(simulation.waiting_customers)
+        data['current_tellers'] = fixed_tellers
+        data['current_anger'] = float(simulation.anger_tracker.current_anger)
+        data['total_served'] = simulation.metrics.total_served
+        data['total_reneged'] = simulation.metrics.total_reneged
+        data['total_arrivals'] = simulation.metrics.total_arrivals
+        
+        # Calculate labor cost
+        interval_hours = decision_interval / 60.0
+        teller_hours_this_interval = fixed_tellers * interval_hours
+        data['teller_hours'] += teller_hours_this_interval
+        data['total_labor_cost'] = data['teller_hours'] * data['cost_per_teller_hour']
+        
+        if len(data['logs']) > 50:
+            data['logs'] = data['logs'][-50:]
+        
+        save_traditional_state(data)
+        
+        sim_time += decision_interval
+        time.sleep(decision_interval / speed)
+    
+    data['is_running'] = False
+    data['is_complete'] = True
+    data['logs'].append(f"✅ TRADITIONAL Complete! Served: {data['total_served']}, Reneged: {data['total_reneged']}")
+    save_traditional_state(data)
 
 
 def run_scenario_thread(scenario: Scenario, speed: float = 10.0):
@@ -564,7 +688,33 @@ def main():
             clear_stop()
             if STATE_FILE.exists():
                 STATE_FILE.unlink()
+            if STATE_FILE_TRADITIONAL.exists():
+                STATE_FILE_TRADITIONAL.unlink()
             st.rerun()
+        
+        st.divider()
+        
+        # COMPARISON MODE
+        compare_mode = st.checkbox("📊 Compare with Traditional", value=False, disabled=data['is_running'],
+                                    help="Run both dynamic and fixed-teller simulations")
+        
+        if compare_mode:
+            fixed_tellers = TRADITIONAL_TELLER_COUNTS.get(scenario.value, 5)
+            st.info(f"Traditional: Fixed {fixed_tellers} tellers")
+        
+        # Separate Compare button
+        if compare_mode:
+            if st.button("🔀 Run Comparison", disabled=data['is_running'], type="secondary", use_container_width=True):
+                clear_stop()
+                if STATE_FILE_TRADITIONAL.exists():
+                    STATE_FILE_TRADITIONAL.unlink()
+                # Start both threads
+                thread1 = threading.Thread(target=run_scenario_thread, args=(scenario, float(speed)), daemon=True)
+                thread2 = threading.Thread(target=run_traditional_thread, args=(scenario, float(speed)), daemon=True)
+                thread1.start()
+                thread2.start()
+                time.sleep(0.3)
+                st.rerun()
         
         st.divider()
         if data['is_running']:
@@ -573,6 +723,9 @@ def main():
             st.success("✅ Complete!")
         else:
             st.info("Ready")
+    
+    # Check if comparison mode data exists
+    trad_data = load_traditional_state()
     
     # Metrics - 7 columns including cost
     cols = st.columns(7)
@@ -639,8 +792,103 @@ def main():
                 for action, count in counts.most_common():
                     st.write(f"- {action}: {count}")
     
+    # COMPARISON RESULTS (when both complete)
+    if data['is_complete'] and trad_data.get('is_complete', False) and trad_data.get('total_arrivals', 0) > 0:
+        st.markdown("---")
+        st.markdown("## 📊 Traditional vs Dynamic Comparison")
+        
+        # Calculate metrics for both
+        dyn_service_rate = data['total_served'] / max(1, data['total_arrivals']) * 100
+        trad_service_rate = trad_data['total_served'] / max(1, trad_data['total_arrivals']) * 100
+        
+        dyn_cost_per_cust = data.get('total_labor_cost', 0) / max(1, data['total_served'])
+        trad_cost_per_cust = trad_data.get('total_labor_cost', 0) / max(1, trad_data['total_served'])
+        
+        # Side-by-side comparison table
+        c1, c2, c3 = st.columns([1, 2, 2])
+        
+        with c1:
+            st.markdown("### Metric")
+            st.write("**Service Rate**")
+            st.write("**Customers Served**")
+            st.write("**Customers Reneged**")
+            st.write("**Total Cost**")
+            st.write("**Cost/Customer**")
+            st.write("**Peak Queue**")
+            st.write("**Peak Tellers**")
+            st.write("**Avg Anger**")
+        
+        with c2:
+            st.markdown("### 🤖 Dynamic (Ours)")
+            st.write(f"**{dyn_service_rate:.1f}%**")
+            st.write(f"{data['total_served']}")
+            st.write(f"{data['total_reneged']}")
+            st.write(f"${data.get('total_labor_cost', 0):.0f}")
+            st.write(f"${dyn_cost_per_cust:.2f}")
+            st.write(f"{max(data['queue_lengths']) if data['queue_lengths'] else 0}")
+            st.write(f"{max(data['teller_counts']) if data['teller_counts'] else 0}")
+            st.write(f"{np.mean(data['anger_levels']) if data['anger_levels'] else 0:.2f}")
+        
+        with c3:
+            st.markdown("### 📊 Traditional (Fixed)")
+            st.write(f"**{trad_service_rate:.1f}%**")
+            st.write(f"{trad_data['total_served']}")
+            st.write(f"{trad_data['total_reneged']}")
+            st.write(f"${trad_data.get('total_labor_cost', 0):.0f}")
+            st.write(f"${trad_cost_per_cust:.2f}")
+            st.write(f"{max(trad_data['queue_lengths']) if trad_data['queue_lengths'] else 0}")
+            st.write(f"{max(trad_data['teller_counts']) if trad_data['teller_counts'] else 0}")
+            st.write(f"{np.mean(trad_data['anger_levels']) if trad_data['anger_levels'] else 0:.2f}")
+        
+        # Improvements section
+        st.markdown("### 📈 Improvement Analysis")
+        
+        improvements = []
+        
+        # Service rate improvement
+        service_diff = dyn_service_rate - trad_service_rate
+        if service_diff > 0:
+            improvements.append(f"✅ **+{service_diff:.1f}% better service rate** with dynamic scaling")
+        else:
+            improvements.append(f"⚠️ {abs(service_diff):.1f}% lower service rate (traditional wins)")
+        
+        # Reneged improvement
+        renege_diff = trad_data['total_reneged'] - data['total_reneged']
+        if renege_diff > 0:
+            improvements.append(f"✅ **{renege_diff} fewer customers left** without service")
+        elif renege_diff < 0:
+            improvements.append(f"⚠️ {abs(renege_diff)} more customers left")
+        
+        # Cost efficiency
+        cost_diff = trad_data.get('total_labor_cost', 0) - data.get('total_labor_cost', 0)
+        if cost_diff > 0:
+            improvements.append(f"✅ **${cost_diff:.0f} saved** in labor costs")
+        else:
+            improvements.append(f"💰 ${abs(cost_diff):.0f} additional cost for better service")
+        
+        # Cost per customer
+        cpc_diff = trad_cost_per_cust - dyn_cost_per_cust
+        if cpc_diff > 0:
+            improvements.append(f"✅ **${cpc_diff:.2f} cheaper per customer** served")
+        else:
+            improvements.append(f"💰 ${abs(cpc_diff):.2f} more per customer for better service")
+        
+        for imp in improvements:
+            st.write(imp)
+        
+        # Verdict
+        st.markdown("### 🏆 Verdict")
+        if dyn_service_rate > trad_service_rate and data['total_reneged'] < trad_data['total_reneged']:
+            st.success("**Dynamic Optimizer Wins!** Better service rate with fewer customer walkouts.")
+        elif dyn_service_rate > trad_service_rate:
+            st.success("**Dynamic Optimizer Wins!** Better service rate overall.")
+        elif cost_diff > 0:
+            st.info("**Cost Advantage!** Dynamic saves money while maintaining service.")
+        else:
+            st.warning("**Traditional may be sufficient** for this scenario.")
+    
     # Auto-refresh
-    if data['is_running']:
+    if data['is_running'] or trad_data.get('is_running', False):
         time.sleep(0.5)
         st.rerun()
 
