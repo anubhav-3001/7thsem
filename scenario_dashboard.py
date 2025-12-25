@@ -176,6 +176,9 @@ def get_default_state():
         'total_served': 0,
         'total_reneged': 0,
         'total_arrivals': 0,
+        'total_labor_cost': 0.0,  # Cumulative labor cost
+        'cost_per_teller_hour': 25.0,  # $25/hour per teller
+        'teller_hours': 0.0,  # Total teller-hours used
         'is_running': False,
         'is_complete': False,
     }
@@ -368,6 +371,13 @@ def run_scenario_thread(scenario: Scenario, speed: float = 10.0):
         data['total_served'] = simulation.metrics.total_served
         data['total_reneged'] = simulation.metrics.total_reneged
         data['total_arrivals'] = simulation.metrics.total_arrivals
+        
+        # Calculate labor cost for this interval
+        # decision_interval is in minutes, convert to hours
+        interval_hours = decision_interval / 60.0
+        teller_hours_this_interval = len(simulation.tellers) * interval_hours
+        data['teller_hours'] += teller_hours_this_interval
+        data['total_labor_cost'] = data['teller_hours'] * data['cost_per_teller_hour']
         
         # Publish state update to Kafka
         if kafka_producer:
@@ -564,14 +574,15 @@ def main():
         else:
             st.info("Ready")
     
-    # Metrics
-    cols = st.columns(6)
+    # Metrics - 7 columns including cost
+    cols = st.columns(7)
     cols[0].metric("🕐 Time", data['current_time'])
     cols[1].metric("👥 Queue", data['current_queue'])
     cols[2].metric("🧑‍💼 Tellers", data['current_tellers'])
     cols[3].metric("😠 Anger", f"{data['current_anger']:.1f}")
     cols[4].metric("✅ Served", data['total_served'])
     cols[5].metric("❌ Reneged", data['total_reneged'])
+    cols[6].metric("💰 Cost", f"${data.get('total_labor_cost', 0):.0f}")
     
     # Charts
     c1, c2 = st.columns([2, 1])
@@ -589,6 +600,44 @@ def main():
     # Logs
     st.markdown("### 📋 Logs")
     st.code("\n".join(data['logs'][-20:]) if data['logs'] else "Waiting...", language=None)
+    
+    # Final Statistics (when complete)
+    if data['is_complete'] and data['total_arrivals'] > 0:
+        st.markdown("### 📊 Final Statistics")
+        
+        c1, c2, c3, c4 = st.columns(4)
+        
+        with c1:
+            st.markdown("**Service Metrics**")
+            service_rate = data['total_served'] / max(1, data['total_arrivals']) * 100
+            st.write(f"- Arrivals: {data['total_arrivals']}")
+            st.write(f"- Served: {data['total_served']}")
+            st.write(f"- Reneged: {data['total_reneged']}")
+            st.write(f"- **Service Rate: {service_rate:.1f}%**")
+        
+        with c2:
+            st.markdown("**Teller Metrics**")
+            if data['teller_counts']:
+                st.write(f"- Min Tellers: {min(data['teller_counts'])}")
+                st.write(f"- Max Tellers: {max(data['teller_counts'])}")
+                st.write(f"- Avg Tellers: {np.mean(data['teller_counts']):.1f}")
+        
+        with c3:
+            st.markdown("**💰 Cost Analysis**")
+            st.write(f"- Teller Hours: {data.get('teller_hours', 0):.1f} hrs")
+            st.write(f"- Rate: ${data.get('cost_per_teller_hour', 25)}/hr")
+            st.write(f"- **Total Cost: ${data.get('total_labor_cost', 0):.2f}**")
+            if data['total_served'] > 0:
+                cost_per_customer = data.get('total_labor_cost', 0) / data['total_served']
+                st.write(f"- Cost/Customer: ${cost_per_customer:.2f}")
+        
+        with c4:
+            st.markdown("**Decisions**")
+            if data['decisions']:
+                from collections import Counter
+                counts = Counter(data['decisions'])
+                for action, count in counts.most_common():
+                    st.write(f"- {action}: {count}")
     
     # Auto-refresh
     if data['is_running']:
