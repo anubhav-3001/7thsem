@@ -2,7 +2,7 @@
 Scenario Testing Dashboard
 ==========================
 
-Real-time dashboard using file-based state sharing between threads.
+Real-time dashboard with Kafka integration for event streaming.
 
 Usage:
     streamlit run scenario_dashboard.py --server.port 8502
@@ -16,9 +16,14 @@ import time
 import threading
 import json
 import os
-from typing import Dict
+from datetime import datetime
+from typing import Dict, Optional
 from enum import Enum
 from pathlib import Path
+
+# Kafka imports
+from kafka import KafkaProducer, KafkaConsumer
+from kafka.errors import NoBrokersAvailable
 
 # Import simulation components
 from simulation_engine import AffectiveSimulationEngine, Customer
@@ -28,6 +33,26 @@ from optimization_agent import OptimizationAgent, SystemState, Action
 # State file path
 STATE_FILE = Path(__file__).parent / ".scenario_state.json"
 STOP_FILE = Path(__file__).parent / ".scenario_stop"
+
+# Kafka configuration
+KAFKA_BOOTSTRAP = "localhost:9092"
+KAFKA_TOPIC_SCENARIO = "scenario_events"
+KAFKA_TOPIC_DECISIONS = "scenario_decisions"
+
+
+def get_kafka_producer() -> Optional[KafkaProducer]:
+    """Create Kafka producer with error handling"""
+    try:
+        producer = KafkaProducer(
+            bootstrap_servers=KAFKA_BOOTSTRAP,
+            value_serializer=lambda v: json.dumps(v).encode('utf-8'),
+            api_version=(2, 5, 0)
+        )
+        return producer
+    except NoBrokersAvailable:
+        return None
+    except Exception:
+        return None
 
 # =============================================================================
 # SCENARIO DEFINITIONS
@@ -182,8 +207,12 @@ def clear_stop():
 
 
 def run_scenario_thread(scenario: Scenario, speed: float = 10.0):
-    """Run scenario and save state to file for dashboard to read"""
+    """Run scenario and publish events to Kafka"""
     config = SCENARIO_CONFIGS[scenario]
+    
+    # Initialize Kafka producer
+    kafka_producer = get_kafka_producer()
+    kafka_connected = kafka_producer is not None
     
     # Initialize state
     data = get_default_state()
@@ -191,8 +220,26 @@ def run_scenario_thread(scenario: Scenario, speed: float = 10.0):
     data['is_running'] = True
     data['logs'].append(f"🚀 Starting {config['name']}")
     data['logs'].append(f"Duration: {config['duration']} hours, Speed: {speed}x")
+    if kafka_connected:
+        data['logs'].append("✓ Connected to Kafka")
+    else:
+        data['logs'].append("⚠ Kafka not available - file mode only")
     save_state(data)
     
+    # Publish scenario start event to Kafka
+    if kafka_producer:
+        start_event = {
+            "event_type": "SCENARIO_START",
+            "timestamp": datetime.now().isoformat(),
+            "scenario": scenario.value,
+            "config": {
+                "duration_hours": config['duration'],
+                "initial_tellers": config['initial_tellers'],
+                "speed": speed
+            }
+        }
+        kafka_producer.send(KAFKA_TOPIC_SCENARIO, start_event)
+        kafka_producer.flush()
     # Clear stop flag
     clear_stop()
     
@@ -314,6 +361,40 @@ def run_scenario_thread(scenario: Scenario, speed: float = 10.0):
         data['total_reneged'] = simulation.metrics.total_reneged
         data['total_arrivals'] = simulation.metrics.total_arrivals
         
+        # Publish state update to Kafka
+        if kafka_producer:
+            state_event = {
+                "event_type": "STATE_UPDATE",
+                "timestamp": datetime.now().isoformat(),
+                "sim_time": time_str,
+                "metrics": {
+                    "queue_length": len(simulation.waiting_customers),
+                    "teller_count": len(simulation.tellers),
+                    "anger_level": float(simulation.anger_tracker.current_anger),
+                    "arrival_rate": float(current_rate),
+                    "served": simulation.metrics.total_served,
+                    "reneged": simulation.metrics.total_reneged
+                },
+                "decision": {
+                    "action": action.value,
+                    "reason": command.get("reason", "cost_optimization")
+                }
+            }
+            kafka_producer.send(KAFKA_TOPIC_SCENARIO, state_event)
+            
+            # Publish decision to separate topic
+            decision_event = {
+                "timestamp": datetime.now().isoformat(),
+                "action": action.value,
+                "context": {
+                    "queue": len(simulation.waiting_customers),
+                    "tellers": len(simulation.tellers),
+                    "anger": float(simulation.anger_tracker.current_anger),
+                    "predicted_arrivals": prediction["ucb"]
+                }
+            }
+            kafka_producer.send(KAFKA_TOPIC_DECISIONS, decision_event)
+        
         # Keep logs manageable
         if len(data['logs']) > 50:
             data['logs'] = data['logs'][-50:]
@@ -324,10 +405,31 @@ def run_scenario_thread(scenario: Scenario, speed: float = 10.0):
         sim_time += decision_interval
         time.sleep(decision_interval / speed)
     
+    # Scenario complete
     data['is_running'] = False
     data['is_complete'] = True
     data['logs'].append(f"✅ Complete! Served: {data['total_served']}, Reneged: {data['total_reneged']}")
     save_state(data)
+    
+    # Publish completion event to Kafka
+    if kafka_producer:
+        complete_event = {
+            "event_type": "SCENARIO_COMPLETE",
+            "timestamp": datetime.now().isoformat(),
+            "scenario": scenario.value,
+            "final_metrics": {
+                "total_arrivals": data['total_arrivals'],
+                "total_served": data['total_served'],
+                "total_reneged": data['total_reneged'],
+                "service_rate": data['total_served'] / max(1, data['total_arrivals']) * 100,
+                "peak_queue": max(data['queue_lengths']) if data['queue_lengths'] else 0,
+                "peak_tellers": max(data['teller_counts']) if data['teller_counts'] else 0
+            }
+        }
+        kafka_producer.send(KAFKA_TOPIC_SCENARIO, complete_event)
+        kafka_producer.flush()
+        kafka_producer.close()
+    
     clear_stop()
 
 
