@@ -167,10 +167,9 @@ def clear_stop():
 def run_traditional_simulation(scenario: Scenario, speed: float):
     """Run traditional queue with fixed number of tellers"""
     config = SCENARIO_CONFIGS[scenario]
-    data = get_default_state("Traditional")
-    data['current_tellers'] = config['fixed_tellers']
+    # Load the pre-initialized state (created by run_both_simulations)
+    data = load_state(STATE_FILE_TRAD, "Traditional")
     data['is_running'] = True
-    save_state(data, STATE_FILE_TRAD)
     
     # Initialize simulation with FIXED teller count
     np.random.seed(42)
@@ -258,10 +257,9 @@ def run_traditional_simulation(scenario: Scenario, speed: float):
 def run_dynamic_simulation(scenario: Scenario, speed: float):
     """Run dynamic queue with our optimizer"""
     config = SCENARIO_CONFIGS[scenario]
-    data = get_default_state("Dynamic (Ours)")
-    data['current_tellers'] = config['initial_tellers']
+    # Load the pre-initialized state (created by run_both_simulations)
+    data = load_state(STATE_FILE_DYN, "Dynamic (Ours)")
     data['is_running'] = True
-    save_state(data, STATE_FILE_DYN)
     
     # Initialize simulation
     np.random.seed(42)  # Same seed for fair comparison
@@ -399,11 +397,21 @@ def run_both_simulations(scenario: Scenario, speed: float):
     """Run both simulations in parallel threads"""
     clear_stop()
     
-    # Clean up old state files
-    if STATE_FILE_TRAD.exists():
-        STATE_FILE_TRAD.unlink()
-    if STATE_FILE_DYN.exists():
-        STATE_FILE_DYN.unlink()
+    config = SCENARIO_CONFIGS[scenario]
+    
+    # Initialize state files BEFORE starting threads (prevents race condition)
+    trad_state = get_default_state("Traditional")
+    trad_state['current_tellers'] = config['fixed_tellers']
+    trad_state['is_running'] = True
+    save_state(trad_state, STATE_FILE_TRAD)
+    
+    dyn_state = get_default_state("Dynamic (Ours)")
+    dyn_state['current_tellers'] = config['initial_tellers']
+    dyn_state['is_running'] = True
+    save_state(dyn_state, STATE_FILE_DYN)
+    
+    # Small delay to ensure files are written
+    time.sleep(0.2)
     
     # Start both threads
     t1 = threading.Thread(target=run_traditional_simulation, args=(scenario, speed), daemon=True)
