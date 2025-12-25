@@ -59,17 +59,18 @@ logger = logging.getLogger(__name__)
 W_REF = 5.0  # Reference wait time (minutes)
 
 # Cost weights (tunable hyperparameters)
-# Balanced for service quality and cost efficiency
-C_LABOR = 3.0       # Moderate labor cost
-C_WAIT = 20.0       # Balanced wait cost
+# Balanced for BOTH good service AND cost control
+C_LABOR = 8.0       # Higher labor cost = scales down faster after rush
+C_WAIT = 30.0       # High wait cost = responds quickly to queues
 C_BURNOUT = 50.0    # Cost per burnt-out teller (highest!)
 
 # Emergency thresholds - balanced for responsiveness
-QUEUE_EMERGENCY_THRESHOLD = 8   # Force ADD_TELLER above this (quick response)
-QUEUE_HIGH_THRESHOLD = 5        # Start considering adding teller
+QUEUE_EMERGENCY_THRESHOLD = 12  # Force ADD_TELLER above this  
+QUEUE_HIGH_THRESHOLD = 8        # Block DELAY/REMOVE above this  
+QUEUE_LOW_THRESHOLD = 3         # Allow REMOVE below this to save costs
 
 # Decision interval
-DECISION_INTERVAL_MINUTES = 2.0  # Fast response
+DECISION_INTERVAL_MINUTES = 2.0  # Fast response time
 
 # Fluid approximation parameters
 MU_SERVICE = 1.0 / 3.0  # Service rate (customers/minute)
@@ -416,6 +417,17 @@ class OptimizationAgent:
             }
             logger.info(f"🚨 EMERGENCY ADD_TELLER: Queue={state.current_queue}")
             return Action.ADD_TELLER, command
+        
+        # COST SAVINGS: Remove teller when queue is very low and we have excess
+        if state.current_queue <= QUEUE_LOW_THRESHOLD and state.num_tellers > 5:
+            command = {
+                "action": Action.REMOVE_TELLER.value,
+                "timestamp": timestamp,
+                "reason": f"COST_SAVINGS: Queue={state.current_queue} <= {QUEUE_LOW_THRESHOLD}, Tellers={state.num_tellers}",
+                "cost_analysis": None
+            }
+            logger.info(f"💰 COST_SAVINGS REMOVE_TELLER: Queue={state.current_queue}, Tellers={state.num_tellers}")
+            return Action.REMOVE_TELLER, command
             
         # Evaluate all actions
         evaluations: Dict[Action, CostBreakdown] = {}
