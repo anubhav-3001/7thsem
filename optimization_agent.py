@@ -60,9 +60,13 @@ W_REF = 5.0  # Reference wait time (minutes)
 
 # Cost weights (tunable hyperparameters)
 # Wait cost increased to prioritize service over cost savings
-C_LABOR = 5.0       # Reduced from 10 - cheaper to add tellers
-C_WAIT = 15.0       # Increased from 5 - penalize long waits more
+C_LABOR = 2.0       # Reduced from 5 - much cheaper to add tellers in crisis
+C_WAIT = 25.0       # Increased from 15 - heavily penalize long waits
 C_BURNOUT = 50.0    # Cost per burnt-out teller (highest!)
+
+# Emergency thresholds
+QUEUE_EMERGENCY_THRESHOLD = 10  # Force ADD_TELLER above this queue size
+QUEUE_HIGH_THRESHOLD = 6        # Consider adding teller
 
 # Decision interval
 DECISION_INTERVAL_MINUTES = 2.0  # Reduced from 5 for faster response
@@ -389,14 +393,29 @@ class OptimizationAgent:
         
         # Check if we're in delay mode
         if self.delay_remaining > 0:
-            self.delay_remaining -= 1
+            # EMERGENCY OVERRIDE: Skip delay if queue is critical
+            if state.current_queue >= QUEUE_EMERGENCY_THRESHOLD:
+                self.delay_remaining = 0  # Cancel delay - emergency!
+            else:
+                self.delay_remaining -= 1
+                command = {
+                    "action": Action.DELAY_DECISION.value,
+                    "timestamp": timestamp,
+                    "reason": f"Delay active ({self.delay_remaining} intervals remaining)",
+                    "cost_analysis": None
+                }
+                return Action.DELAY_DECISION, command
+        
+        # EMERGENCY: Immediately add teller if queue is critical
+        if state.current_queue >= QUEUE_EMERGENCY_THRESHOLD:
             command = {
-                "action": Action.DELAY_DECISION.value,
+                "action": Action.ADD_TELLER.value,
                 "timestamp": timestamp,
-                "reason": f"Delay active ({self.delay_remaining} intervals remaining)",
+                "reason": f"EMERGENCY: Queue={state.current_queue} >= {QUEUE_EMERGENCY_THRESHOLD}",
                 "cost_analysis": None
             }
-            return Action.DELAY_DECISION, command
+            logger.info(f"🚨 EMERGENCY ADD_TELLER: Queue={state.current_queue}")
+            return Action.ADD_TELLER, command
             
         # Evaluate all actions
         evaluations: Dict[Action, CostBreakdown] = {}
@@ -406,7 +425,16 @@ class OptimizationAgent:
             if action == Action.REMOVE_TELLER and state.num_tellers <= 3:
                 # Keep minimum 3 tellers for adequate service
                 continue
+            # Don't remove tellers if queue is high
+            if action == Action.REMOVE_TELLER and state.current_queue >= QUEUE_HIGH_THRESHOLD:
+                continue
             if action == Action.GIVE_BREAK and target_teller is None:
+                continue
+            # Don't give breaks if queue is high
+            if action == Action.GIVE_BREAK and state.current_queue >= QUEUE_HIGH_THRESHOLD:
+                continue
+            # Don't delay if queue is building
+            if action == Action.DELAY_DECISION and state.current_queue >= QUEUE_HIGH_THRESHOLD:
                 continue
                 
             cost = self._calculate_cost(

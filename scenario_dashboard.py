@@ -239,9 +239,9 @@ def run_scenario_thread(scenario: Scenario, speed: float = 10.0):
             customer = Customer(
                 customer_id=str(uuid.uuid4())[:8],
                 arrival_time=simulation.env.now,
-                patience_limit=np.random.exponential(15),
-                task_complexity=np.clip(np.random.exponential(1.0), 0.5, 3.0),
-                contagion_factor=np.random.beta(2, 5)
+                patience_limit=np.random.exponential(25),  # Increased from 15 for more tolerance
+                task_complexity=np.clip(np.random.exponential(0.8), 0.3, 2.0),  # Faster service
+                contagion_factor=np.random.beta(2, 8)  # Less susceptible to anger contagion
             )
             simulation.add_customer(customer)
         
