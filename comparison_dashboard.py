@@ -421,19 +421,23 @@ def create_comparison_chart(trad_data, dyn_data, metric='queue_lengths', title="
     """Create side-by-side comparison chart"""
     fig = go.Figure()
     
-    if trad_data['time_points']:
+    # Get metric data with fallback to empty list
+    trad_metric = trad_data.get(metric, [])
+    dyn_metric = dyn_data.get(metric, [])
+    
+    if trad_data.get('time_points') and trad_metric:
         fig.add_trace(go.Scatter(
             x=trad_data['time_points'][-40:],
-            y=trad_data[metric][-40:],
+            y=trad_metric[-40:],
             name='Traditional (Fixed)',
             line=dict(color='#FF6B6B', width=3),
             mode='lines+markers'
         ))
     
-    if dyn_data['time_points']:
+    if dyn_data.get('time_points') and dyn_metric:
         fig.add_trace(go.Scatter(
             x=dyn_data['time_points'][-40:],
-            y=dyn_data[metric][-40:],
+            y=dyn_metric[-40:],
             name='Dynamic (Ours)',
             line=dict(color='#4ECDC4', width=3),
             mode='lines+markers'
