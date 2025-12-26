@@ -48,7 +48,7 @@ class BayesianLSTM(nn.Module):
     def __init__(
         self,
         input_size: int = 4,
-        hidden_size: int = 64,
+        hidden_size: int = 128,
         num_layers: int = 2,
         dropout_prob: float = 0.5
     ):

@@ -69,15 +69,15 @@ SCENARIOS: Dict[Scenario, ScenarioConfig] = {
         Tests: Rapid teller scaling, emergency response
         Expected: Tellers jump from 3 to 10+ during rush
         """,
-        duration_hours=2.0,
+        duration_hours=4.0,  # DOUBLED from 2.0
         initial_tellers=3,
         arrival_schedule=[
-            {"start": 0, "end": 20, "rate": 20},     # Normal opening
-            {"start": 20, "end": 25, "rate": 50},    # Building
-            {"start": 25, "end": 40, "rate": 200},   # FLASH MOB - extreme rush!
-            {"start": 40, "end": 50, "rate": 100},   # Subsiding
-            {"start": 50, "end": 80, "rate": 30},    # Recovery
-            {"start": 80, "end": 120, "rate": 15},   # Quiet afternoon
+            {"start": 0, "end": 40, "rate": 20},      # Extended opening
+            {"start": 40, "end": 50, "rate": 50},     # Building
+            {"start": 50, "end": 80, "rate": 200},    # FLASH MOB - extreme rush!
+            {"start": 80, "end": 100, "rate": 100},   # Subsiding
+            {"start": 100, "end": 160, "rate": 30},   # Recovery
+            {"start": 160, "end": 240, "rate": 15},   # Quiet afternoon (extended)
         ]
     ),
     
@@ -88,15 +88,15 @@ SCENARIOS: Dict[Scenario, ScenarioConfig] = {
         Tests: Predictable scaling, smooth transitions
         Expected: Gradual teller increase, then decrease
         """,
-        duration_hours=3.0,
+        duration_hours=6.0,  # DOUBLED from 3.0
         initial_tellers=3,
         arrival_schedule=[
-            {"start": 0, "end": 30, "rate": 15},     # Morning slow
-            {"start": 30, "end": 60, "rate": 30},    # Morning pickup
-            {"start": 60, "end": 90, "rate": 60},    # PRE-LUNCH rush building
-            {"start": 90, "end": 120, "rate": 90},   # LUNCH PEAK
-            {"start": 120, "end": 150, "rate": 50},  # Post-lunch decline
-            {"start": 150, "end": 180, "rate": 20},  # Afternoon quiet
+            {"start": 0, "end": 60, "rate": 15},      # Morning slow (extended)
+            {"start": 60, "end": 120, "rate": 30},    # Morning pickup
+            {"start": 120, "end": 180, "rate": 60},   # PRE-LUNCH rush building
+            {"start": 180, "end": 240, "rate": 90},   # LUNCH PEAK
+            {"start": 240, "end": 300, "rate": 50},   # Post-lunch decline
+            {"start": 300, "end": 360, "rate": 20},   # Afternoon quiet (extended)
         ]
     ),
     
@@ -107,14 +107,14 @@ SCENARIOS: Dict[Scenario, ScenarioConfig] = {
         Tests: Maximum capacity handling, break scheduling under load
         Expected: Maximum tellers for extended period
         """,
-        duration_hours=2.5,
+        duration_hours=5.0,  # DOUBLED from 2.5
         initial_tellers=5,
         arrival_schedule=[
-            {"start": 0, "end": 15, "rate": 40},     # Already busy at open
-            {"start": 15, "end": 45, "rate": 80},    # Morning surge
-            {"start": 45, "end": 90, "rate": 100},   # SUSTAINED HIGH LOAD
-            {"start": 90, "end": 120, "rate": 90},   # Still very busy
-            {"start": 120, "end": 150, "rate": 60},  # Finally calming
+            {"start": 0, "end": 30, "rate": 40},      # Already busy at open
+            {"start": 30, "end": 90, "rate": 80},     # Morning surge (extended)
+            {"start": 90, "end": 180, "rate": 100},   # SUSTAINED HIGH LOAD
+            {"start": 180, "end": 240, "rate": 90},   # Still very busy
+            {"start": 240, "end": 300, "rate": 60},   # Finally calming
         ]
     ),
     
@@ -125,15 +125,15 @@ SCENARIOS: Dict[Scenario, ScenarioConfig] = {
         Tests: Late-day surge handling, capacity limits
         Expected: Dramatic increase in late afternoon
         """,
-        duration_hours=2.5,
+        duration_hours=5.0,  # DOUBLED from 2.5
         initial_tellers=3,
         arrival_schedule=[
-            {"start": 0, "end": 30, "rate": 10},     # Very quiet morning
-            {"start": 30, "end": 60, "rate": 25},    # Slow pickup
-            {"start": 60, "end": 90, "rate": 50},    # Building
-            {"start": 90, "end": 120, "rate": 120},  # AFTERNOON RUSH
-            {"start": 120, "end": 140, "rate": 150}, # PEAK RUSH before close
-            {"start": 140, "end": 150, "rate": 40},  # Quick dropoff (closing)
+            {"start": 0, "end": 60, "rate": 10},      # Very quiet morning (extended)
+            {"start": 60, "end": 120, "rate": 25},    # Slow pickup
+            {"start": 120, "end": 180, "rate": 50},   # Building
+            {"start": 180, "end": 240, "rate": 120},  # AFTERNOON RUSH
+            {"start": 240, "end": 280, "rate": 150},  # PEAK RUSH before close
+            {"start": 280, "end": 300, "rate": 40},   # Quick dropoff (closing)
         ]
     ),
     
@@ -144,12 +144,12 @@ SCENARIOS: Dict[Scenario, ScenarioConfig] = {
         Tests: Removing unnecessary tellers, efficient break scheduling
         Expected: Minimal tellers, many breaks given
         """,
-        duration_hours=1.5,
+        duration_hours=3.0,  # DOUBLED from 1.5
         initial_tellers=5,
         arrival_schedule=[
-            {"start": 0, "end": 30, "rate": 10},     # Very quiet
-            {"start": 30, "end": 60, "rate": 15},    # Still quiet
-            {"start": 60, "end": 90, "rate": 12},    # Maintained low
+            {"start": 0, "end": 60, "rate": 10},      # Very quiet (extended)
+            {"start": 60, "end": 120, "rate": 15},    # Still quiet
+            {"start": 120, "end": 180, "rate": 12},   # Maintained low (extended)
         ]
     ),
     
@@ -160,17 +160,17 @@ SCENARIOS: Dict[Scenario, ScenarioConfig] = {
         Tests: System stability under wild fluctuations
         Expected: Oscillating teller count
         """,
-        duration_hours=2.0,
+        duration_hours=4.0,  # DOUBLED from 2.0
         initial_tellers=3,
         arrival_schedule=[
-            {"start": 0, "end": 10, "rate": 20},
-            {"start": 10, "end": 20, "rate": 150},   # Spike 1
-            {"start": 20, "end": 30, "rate": 10},    # Drop
-            {"start": 30, "end": 40, "rate": 180},   # Spike 2 (higher)
-            {"start": 40, "end": 55, "rate": 15},    # Drop
-            {"start": 55, "end": 70, "rate": 200},   # Spike 3 (maximum)
-            {"start": 70, "end": 90, "rate": 25},    # Recovery
-            {"start": 90, "end": 120, "rate": 100},  # Sustained moderate
+            {"start": 0, "end": 20, "rate": 20},
+            {"start": 20, "end": 40, "rate": 150},    # Spike 1 (extended)
+            {"start": 40, "end": 60, "rate": 10},     # Drop
+            {"start": 60, "end": 80, "rate": 180},    # Spike 2 (higher)
+            {"start": 80, "end": 110, "rate": 15},    # Drop
+            {"start": 110, "end": 140, "rate": 200},  # Spike 3 (maximum)
+            {"start": 140, "end": 180, "rate": 25},   # Recovery
+            {"start": 180, "end": 240, "rate": 100},  # Sustained moderate (extended)
         ]
     ),
 }
@@ -184,10 +184,12 @@ class ScenarioRunner:
     def __init__(
         self,
         scenario: Scenario,
+        mode: str = "MPC",
         speed: float = 1.0,
         seed: int = 42
     ):
         self.config = SCENARIOS[scenario]
+        self.mode = mode
         self.speed = speed
         self.seed = seed
         self.shutdown_event = threading.Event()
@@ -227,11 +229,36 @@ class ScenarioRunner:
         np.random.seed(self.seed)
         
         forecaster = BayesianForecaster(sequence_length=10)
+        forecaster = BayesianForecaster(sequence_length=10)
+        
+        # Try loading scenario-specific weights first
+        scenario_weights = f"forecaster_weights_{self.config.name.replace(' ', '_').replace('Scenario', '').strip().lower()}.pth"
+        # Since config.name is verbose (e.g. "Flash Mob Scenario"), let's use the enum name
+        scenario_key = ""
+        for k, v in SCENARIOS.items():
+            if v == self.config:
+                scenario_key = k.name.lower()
+                break
+                
+        specific_weights = f"forecaster_weights_{scenario_key}.pth"
+        generic_weights = "forecaster_weights.pth"
+        
+        loaded = False
+        # 1. Try Specific
         try:
-            forecaster.load_model('forecaster_weights.pth')
-            logger.info("✓ Loaded pre-trained forecaster weights")
-        except:
-            logger.info("⚠ No pre-trained weights, using untrained model")
+            forecaster.load_model(specific_weights)
+            logger.info(f"✓ Loaded scenario-specific weights: {specific_weights}")
+            loaded = True
+        except FileNotFoundError:
+            # 2. Try Generic
+            try:
+                forecaster.load_model(generic_weights)
+                logger.info(f"✓ Loaded generic weights: {generic_weights}")
+                loaded = True
+            except FileNotFoundError:
+                logger.info("⚠ No pre-trained weights found. Using untrained model.")
+        except Exception as e:
+             logger.warning(f"⚠ Error loading weights: {e}")
         
         simulation = AffectiveSimulationEngine(
             num_tellers=self.config.initial_tellers,
@@ -315,7 +342,7 @@ class ScenarioRunner:
             )
             
             # Get optimizer decision
-            action, command = optimizer.decide(state)
+            action, command = optimizer.decide(state, mode=self.mode)
             
             # Execute action
             if action == Action.ADD_TELLER:
@@ -413,6 +440,14 @@ def main():
         help="List available scenarios and exit"
     )
     
+    parser.add_argument(
+        "--mode",
+        type=str,
+        default="MPC",
+        choices=["MPC", "TRADITIONAL", "RL", "HYBRID"],
+        help="Optimization mode: MPC (AI), TRADITIONAL (Reactive), RL (Deep Q-Network), or HYBRID (MPC+RL)"
+    )
+    
     args = parser.parse_args()
     
     if args.list:
@@ -427,6 +462,7 @@ def main():
     scenario = Scenario[args.scenario]
     runner = ScenarioRunner(
         scenario=scenario,
+        mode=args.mode,
         speed=args.speed,
         seed=args.seed
     )

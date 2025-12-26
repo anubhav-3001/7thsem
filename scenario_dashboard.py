@@ -21,6 +21,12 @@ from typing import Dict, Optional
 from enum import Enum
 from pathlib import Path
 
+# Try to import streamlit-autorefresh, install if needed
+try:
+    from streamlit_autorefresh import st_autorefresh
+except ImportError:
+    st_autorefresh = None
+
 # Kafka imports
 from kafka import KafkaProducer, KafkaConsumer
 from kafka.errors import NoBrokersAvailable
@@ -167,12 +173,15 @@ def get_default_state():
         'teller_counts': [],
         'anger_levels': [],
         'arrival_rates': [],
+        'fatigue_levels': [],  # NEW: Track avg fatigue over time
         'decisions': [],
         'logs': [],
         'current_time': '09:00',
         'current_queue': 0,
         'current_tellers': 3,
         'current_anger': 0.0,
+        'current_fatigue': 0.0,  # NEW: Current avg fatigue
+        'teller_fatigue': {},    # NEW: Individual teller fatigue {id: fatigue}
         'total_served': 0,
         'total_reneged': 0,
         'total_arrivals': 0,
@@ -185,18 +194,36 @@ def get_default_state():
 
 
 def save_state(data):
-    """Save state to file"""
-    with open(STATE_FILE, 'w') as f:
-        json.dump(data, f)
+    """Save state to file atomically to prevent corruption"""
+    import tempfile
+    try:
+        # Write to temp file first, then rename (atomic on most systems)
+        with tempfile.NamedTemporaryFile(mode='w', dir=STATE_FILE.parent, 
+                                          suffix='.tmp', delete=False) as f:
+            json.dump(data, f)
+            temp_path = f.name
+        # Atomic rename
+        Path(temp_path).replace(STATE_FILE)
+    except Exception as e:
+        # Fallback to direct write if atomic fails
+        with open(STATE_FILE, 'w') as f:
+            json.dump(data, f)
 
 
 def load_state():
-    """Load state from file"""
+    """Load state from file with error recovery"""
     try:
         if STATE_FILE.exists():
             with open(STATE_FILE, 'r') as f:
-                return json.load(f)
-    except:
+                content = f.read()
+                if content.strip():  # Only parse if file has content
+                    loaded = json.loads(content)
+                    # Merge with defaults to ensure all keys exist
+                    defaults = get_default_state()
+                    defaults.update(loaded)
+                    return defaults
+    except (json.JSONDecodeError, IOError) as e:
+        # File corrupted, return defaults but preserve is_running if possible
         pass
     return get_default_state()
 
@@ -217,7 +244,7 @@ def clear_stop():
         STOP_FILE.unlink()
 
 
-def run_scenario_thread(scenario: Scenario, speed: float = 10.0):
+def run_scenario_thread(scenario: Scenario, speed: float = 10.0, mode: str = "MPC"):
     """Run scenario and publish events to Kafka"""
     config = SCENARIO_CONFIGS[scenario]
     
@@ -229,7 +256,7 @@ def run_scenario_thread(scenario: Scenario, speed: float = 10.0):
     data = get_default_state()
     data['current_tellers'] = config['initial_tellers']
     data['is_running'] = True
-    data['logs'].append(f"🚀 Starting {config['name']}")
+    data['logs'].append(f"🚀 Starting {config['name']} [{mode}]")
     data['logs'].append(f"Duration: {config['duration']} hours, Speed: {speed}x")
     if kafka_connected:
         data['logs'].append("✓ Connected to Kafka")
@@ -243,6 +270,7 @@ def run_scenario_thread(scenario: Scenario, speed: float = 10.0):
             "event_type": "SCENARIO_START",
             "timestamp": datetime.now().isoformat(),
             "scenario": scenario.value,
+            "mode": mode,
             "config": {
                 "duration_hours": config['duration'],
                 "initial_tellers": config['initial_tellers'],
@@ -285,149 +313,168 @@ def run_scenario_thread(scenario: Scenario, speed: float = 10.0):
                 return period['rate']
         return 5.0
     
-    while sim_time < duration_minutes and not should_stop():
-        current_rate = get_rate(sim_time)
+    try:
+        while sim_time < duration_minutes and not should_stop():
+            current_rate = get_rate(sim_time)
         
-        # Generate arrivals
-        expected = current_rate * (decision_interval / 60)
-        actual_arrivals = np.random.poisson(expected)
+            # Generate arrivals
+            expected = current_rate * (decision_interval / 60)
+            actual_arrivals = np.random.poisson(expected)
         
-        for _ in range(actual_arrivals):
-            import uuid
-            customer = Customer(
-                customer_id=str(uuid.uuid4())[:8],
-                arrival_time=simulation.env.now,
-                patience_limit=np.random.exponential(25),  # Increased from 15 for more tolerance
-                task_complexity=np.clip(np.random.exponential(0.8), 0.3, 2.0),  # Faster service
-                contagion_factor=np.random.beta(2, 8)  # Less susceptible to anger contagion
+            for _ in range(actual_arrivals):
+                import uuid
+                customer = Customer(
+                    customer_id=str(uuid.uuid4())[:8],
+                    arrival_time=simulation.env.now,
+                    patience_limit=np.random.exponential(25),  # Increased from 15 for more tolerance
+                    task_complexity=np.clip(np.random.exponential(0.8), 0.3, 2.0),  # Faster service
+                    contagion_factor=np.random.beta(2, 8)  # Less susceptible to anger contagion
+                )
+                simulation.add_customer(customer)
+        
+            # Step simulation
+            simulation.env.run(until=simulation.env.now + decision_interval)
+        
+            # Update forecaster
+            forecaster.update_history({
+                "arrivals": actual_arrivals,
+                "hour": int(9 + sim_time / 60),
+                "day": 2,
+                "avg_anger": simulation.anger_tracker.current_anger
+            })
+        
+            # Get prediction
+            prediction = forecaster.predict_with_uncertainty(num_samples=30)
+            if prediction is None:
+                prediction = {"mean": current_rate/12, "ucb": current_rate/6, "std": 2.0}
+        
+            # Build state for optimizer
+            num_tellers = len(simulation.tellers)
+            fatigue = {t.teller_id: t.fatigue for t in simulation.tellers}
+            avg_fatigue = np.mean(list(fatigue.values())) if fatigue else 0
+            max_fatigue = max(fatigue.values()) if fatigue else 0
+            burnt_out = sum(1 for f in fatigue.values() if f > 0.8)
+        
+            opt_state = SystemState(
+                num_tellers=num_tellers,
+                current_queue=len(simulation.waiting_customers),
+                avg_fatigue=avg_fatigue,
+                max_fatigue=max_fatigue,
+                burnt_out_count=burnt_out,
+                teller_fatigue=fatigue,
+                lobby_anger=simulation.anger_tracker.current_anger,
+                predicted_arrivals_mean=prediction["mean"],
+                predicted_arrivals_ucb=prediction["ucb"],
+                prediction_uncertainty=prediction["std"],
+                current_wait=simulation.metrics.total_wait_time / max(1, simulation.metrics.total_served) if simulation.metrics.total_served > 0 else 0
             )
-            simulation.add_customer(customer)
         
-        # Step simulation
-        simulation.env.run(until=simulation.env.now + decision_interval)
+            # Get and execute decision (with mode and scenario)
+            action, command = optimizer.decide(opt_state, mode=mode, scenario_name=scenario.name)
         
-        # Update forecaster
-        forecaster.update_history({
-            "arrivals": actual_arrivals,
-            "hour": int(9 + sim_time / 60),
-            "day": 2,
-            "avg_anger": simulation.anger_tracker.current_anger
-        })
+            if action == Action.ADD_TELLER:
+                simulation.add_teller()
+                data['logs'].append(f"➕ ADD_TELLER → {len(simulation.tellers)} tellers")
+            elif action == Action.REMOVE_TELLER:
+                simulation.remove_teller()
+                data['logs'].append(f"➖ REMOVE_TELLER → {len(simulation.tellers)} tellers")
+            elif action == Action.GIVE_BREAK:
+                teller_id = command.get("teller_id")
+                if teller_id is not None:
+                    simulation.give_teller_break(teller_id, 5.0)
+                    data['logs'].append(f"☕ GIVE_BREAK: Teller {teller_id}")
         
-        # Get prediction
-        prediction = forecaster.predict_with_uncertainty(num_samples=30)
-        if prediction is None:
-            prediction = {"mean": current_rate/12, "ucb": current_rate/6, "std": 2.0}
+            # Update state
+            time_str = f"{int(9 + sim_time/60):02d}:{int(sim_time%60):02d}"
+            data['time_points'].append(time_str)
+            data['queue_lengths'].append(len(simulation.waiting_customers))
+            data['teller_counts'].append(len(simulation.tellers))
+            data['anger_levels'].append(float(simulation.anger_tracker.current_anger))
+            data['arrival_rates'].append(float(current_rate))
+            data['decisions'].append(action.value)
         
-        # Build state for optimizer
-        num_tellers = len(simulation.tellers)
-        fatigue = {t.teller_id: t.fatigue for t in simulation.tellers}
-        avg_fatigue = np.mean(list(fatigue.values())) if fatigue else 0
-        max_fatigue = max(fatigue.values()) if fatigue else 0
-        burnt_out = sum(1 for f in fatigue.values() if f > 0.8)
+            # Track fatigue
+            fatigues = [t.fatigue for t in simulation.tellers]
+            avg_fatigue = np.mean(fatigues) if fatigues else 0
+            data['fatigue_levels'].append(float(avg_fatigue))
+            data['current_fatigue'] = float(avg_fatigue)
+            data['teller_fatigue'] = {t.teller_id: float(t.fatigue) for t in simulation.tellers}
         
-        opt_state = SystemState(
-            num_tellers=num_tellers,
-            current_queue=len(simulation.waiting_customers),
-            avg_fatigue=avg_fatigue,
-            max_fatigue=max_fatigue,
-            burnt_out_count=burnt_out,
-            teller_fatigue=fatigue,
-            lobby_anger=simulation.anger_tracker.current_anger,
-            predicted_arrivals_mean=prediction["mean"],
-            predicted_arrivals_ucb=prediction["ucb"],
-            prediction_uncertainty=prediction["std"],
-            current_wait=simulation.metrics.total_wait_time / max(1, simulation.metrics.total_served) if simulation.metrics.total_served > 0 else 0
-        )
+            data['current_time'] = time_str
+            data['current_queue'] = len(simulation.waiting_customers)
+            data['current_tellers'] = len(simulation.tellers)
+            data['current_anger'] = float(simulation.anger_tracker.current_anger)
+            data['total_served'] = simulation.metrics.total_served
+            data['total_reneged'] = simulation.metrics.total_reneged
+            data['total_arrivals'] = simulation.metrics.total_arrivals
         
-        # Get and execute decision
-        action, command = optimizer.decide(opt_state)
+            # Calculate labor cost for this interval
+            # decision_interval is in minutes, convert to hours
+            interval_hours = decision_interval / 60.0
+            teller_hours_this_interval = len(simulation.tellers) * interval_hours
+            data['teller_hours'] += teller_hours_this_interval
+            data['total_labor_cost'] = data['teller_hours'] * data['cost_per_teller_hour']
         
-        if action == Action.ADD_TELLER:
-            simulation.add_teller()
-            data['logs'].append(f"➕ ADD_TELLER → {len(simulation.tellers)} tellers")
-        elif action == Action.REMOVE_TELLER:
-            simulation.remove_teller()
-            data['logs'].append(f"➖ REMOVE_TELLER → {len(simulation.tellers)} tellers")
-        elif action == Action.GIVE_BREAK:
-            teller_id = command.get("teller_id")
-            if teller_id is not None:
-                simulation.give_teller_break(teller_id, 5.0)
-                data['logs'].append(f"☕ GIVE_BREAK: Teller {teller_id}")
-        
-        # Update state
-        time_str = f"{int(9 + sim_time/60):02d}:{int(sim_time%60):02d}"
-        data['time_points'].append(time_str)
-        data['queue_lengths'].append(len(simulation.waiting_customers))
-        data['teller_counts'].append(len(simulation.tellers))
-        data['anger_levels'].append(float(simulation.anger_tracker.current_anger))
-        data['arrival_rates'].append(float(current_rate))
-        data['decisions'].append(action.value)
-        
-        data['current_time'] = time_str
-        data['current_queue'] = len(simulation.waiting_customers)
-        data['current_tellers'] = len(simulation.tellers)
-        data['current_anger'] = float(simulation.anger_tracker.current_anger)
-        data['total_served'] = simulation.metrics.total_served
-        data['total_reneged'] = simulation.metrics.total_reneged
-        data['total_arrivals'] = simulation.metrics.total_arrivals
-        
-        # Calculate labor cost for this interval
-        # decision_interval is in minutes, convert to hours
-        interval_hours = decision_interval / 60.0
-        teller_hours_this_interval = len(simulation.tellers) * interval_hours
-        data['teller_hours'] += teller_hours_this_interval
-        data['total_labor_cost'] = data['teller_hours'] * data['cost_per_teller_hour']
-        
-        # Publish state update to Kafka
-        if kafka_producer:
-            state_event = {
-                "event_type": "STATE_UPDATE",
-                "timestamp": datetime.now().isoformat(),
-                "sim_time": time_str,
-                "metrics": {
-                    "queue_length": len(simulation.waiting_customers),
-                    "teller_count": len(simulation.tellers),
-                    "anger_level": float(simulation.anger_tracker.current_anger),
-                    "arrival_rate": float(current_rate),
-                    "served": simulation.metrics.total_served,
-                    "reneged": simulation.metrics.total_reneged
-                },
-                "decision": {
-                    "action": action.value,
-                    "reason": command.get("reason", "cost_optimization")
+            # Publish state update to Kafka
+            if kafka_producer:
+                state_event = {
+                    "event_type": "STATE_UPDATE",
+                    "timestamp": datetime.now().isoformat(),
+                    "sim_time": time_str,
+                    "metrics": {
+                        "queue_length": len(simulation.waiting_customers),
+                        "teller_count": len(simulation.tellers),
+                        "anger_level": float(simulation.anger_tracker.current_anger),
+                        "arrival_rate": float(current_rate),
+                        "served": simulation.metrics.total_served,
+                        "reneged": simulation.metrics.total_reneged
+                    },
+                    "decision": {
+                        "action": action.value,
+                        "reason": command.get("reason", "cost_optimization")
+                    }
                 }
-            }
-            kafka_producer.send(KAFKA_TOPIC_SCENARIO, state_event)
+                kafka_producer.send(KAFKA_TOPIC_SCENARIO, state_event)
             
-            # Publish decision to separate topic
-            decision_event = {
-                "timestamp": datetime.now().isoformat(),
-                "action": action.value,
-                "context": {
-                    "queue": len(simulation.waiting_customers),
-                    "tellers": len(simulation.tellers),
-                    "anger": float(simulation.anger_tracker.current_anger),
-                    "predicted_arrivals": prediction["ucb"]
+                # Publish decision to separate topic
+                decision_event = {
+                    "timestamp": datetime.now().isoformat(),
+                    "action": action.value,
+                    "context": {
+                        "queue": len(simulation.waiting_customers),
+                        "tellers": len(simulation.tellers),
+                        "anger": float(simulation.anger_tracker.current_anger),
+                        "predicted_arrivals": prediction["ucb"]
+                    }
                 }
-            }
-            kafka_producer.send(KAFKA_TOPIC_DECISIONS, decision_event)
+                kafka_producer.send(KAFKA_TOPIC_DECISIONS, decision_event)
         
-        # Keep logs manageable
-        if len(data['logs']) > 50:
-            data['logs'] = data['logs'][-50:]
+            # Keep logs manageable
+            if len(data['logs']) > 50:
+                data['logs'] = data['logs'][-50:]
         
-        # Save state to file
+            # Save state to file
+            save_state(data)
+        
+            sim_time += decision_interval
+            time.sleep(decision_interval / speed)
+    
+    except Exception as e:
+        # On error, save state and mark as stopped
+        data['logs'].append(f"❌ Error: {str(e)}")
+        data['is_running'] = False
         save_state(data)
-        
-        sim_time += decision_interval
-        time.sleep(decision_interval / speed)
+        raise
     
     # Scenario complete
     data['is_running'] = False
     data['is_complete'] = True
     data['logs'].append(f"✅ Complete! Served: {data['total_served']}, Reneged: {data['total_reneged']}")
+    
+    # Save state multiple times to ensure persistence
     save_state(data)
+    time.sleep(0.1)  # Small delay to ensure file write completes
+    save_state(data)  # Second save for redundancy
     
     # Publish completion event to Kafka
     if kafka_producer:
@@ -525,10 +572,24 @@ def create_decisions_chart(data):
 def main():
     st.set_page_config(page_title="Scenario Dashboard", page_icon="🧪", layout="wide")
     
-    st.title("🧪 Scenario Testing Dashboard")
+    # Load current state from file with caching
+    # Use session_state to avoid race conditions with file writes
+    file_data = load_state()
     
-    # Load current state from file
-    data = load_state()
+    # Only update cached data if file has meaningful content
+    if 'cached_data' not in st.session_state:
+        st.session_state.cached_data = file_data
+    
+    # Update cache if file data has more data points (simulation progressed)
+    file_points = len(file_data.get('time_points', []))
+    cache_points = len(st.session_state.cached_data.get('time_points', []))
+    
+    if file_points >= cache_points or file_data.get('is_complete'):
+        st.session_state.cached_data = file_data
+    
+    data = st.session_state.cached_data
+    
+    st.title("🧪 Scenario Testing Dashboard")
     
     # Sidebar
     with st.sidebar:
@@ -542,13 +603,23 @@ def main():
         config = SCENARIO_CONFIGS[scenario]
         st.caption(config['description'])
         
+        # Mode selector
+        mode = st.selectbox(
+            "Mode", ["MPC", "HYBRID"],
+            disabled=data['is_running'],
+            help="MPC=AI Optimizer, HYBRID=MPC during peaks + RL during low traffic"
+        )
+        
         speed = st.slider("Speed", 5, 50, 20, disabled=data['is_running'])
         
         col1, col2 = st.columns(2)
         with col1:
             if st.button("▶️ Start", disabled=data['is_running'], type="primary", use_container_width=True):
                 clear_stop()
-                thread = threading.Thread(target=run_scenario_thread, args=(scenario, float(speed)), daemon=True)
+                # Clear cached data for fresh start
+                if 'cached_data' in st.session_state:
+                    del st.session_state.cached_data
+                thread = threading.Thread(target=run_scenario_thread, args=(scenario, float(speed), mode), daemon=True)
                 thread.start()
                 time.sleep(0.3)
                 st.rerun()
@@ -559,11 +630,15 @@ def main():
                 time.sleep(0.5)
                 st.rerun()
         
-        # Reset button to clear stuck state
-        if st.button("🔄 Reset", use_container_width=True):
+        # Reset button to clear stuck state (disabled during run and after completion)
+        if st.button("🔄 Reset", use_container_width=True, 
+                     disabled=data['is_running'],
+                     help="Clear all data and start fresh"):
             clear_stop()
             if STATE_FILE.exists():
                 STATE_FILE.unlink()
+            if 'cached_data' in st.session_state:
+                del st.session_state.cached_data
             st.rerun()
         
         st.divider()
@@ -574,15 +649,16 @@ def main():
         else:
             st.info("Ready")
     
-    # Metrics - 7 columns including cost
-    cols = st.columns(7)
+    # Metrics - 8 columns including cost and fatigue
+    cols = st.columns(8)
     cols[0].metric("🕐 Time", data['current_time'])
     cols[1].metric("👥 Queue", data['current_queue'])
     cols[2].metric("🧑‍💼 Tellers", data['current_tellers'])
     cols[3].metric("😠 Anger", f"{data['current_anger']:.1f}")
-    cols[4].metric("✅ Served", data['total_served'])
-    cols[5].metric("❌ Reneged", data['total_reneged'])
-    cols[6].metric("💰 Cost", f"${data.get('total_labor_cost', 0):.0f}")
+    cols[4].metric("😓 Fatigue", f"{data.get('current_fatigue', 0):.1%}")
+    cols[5].metric("✅ Served", data['total_served'])
+    cols[6].metric("❌ Reneged", data['total_reneged'])
+    cols[7].metric("💰 Cost", f"${data.get('total_labor_cost', 0):.0f}")
     
     # Charts
     c1, c2 = st.columns([2, 1])
@@ -596,6 +672,16 @@ def main():
         st.plotly_chart(create_anger_chart(data), use_container_width=True, key="a")
     with c2:
         st.plotly_chart(create_rate_chart(data), use_container_width=True, key="r")
+    
+    # Teller Fatigue Display
+    teller_fatigue = data.get('teller_fatigue', {})
+    if teller_fatigue:
+        st.markdown("### 😓 Teller Fatigue Levels")
+        fatigue_cols = st.columns(min(len(teller_fatigue), 10))
+        for i, (teller_id, fatigue) in enumerate(teller_fatigue.items()):
+            col_idx = i % len(fatigue_cols)
+            color = "🟢" if fatigue < 0.3 else "🟡" if fatigue < 0.6 else "🟠" if fatigue < 0.8 else "🔴"
+            fatigue_cols[col_idx].metric(f"{color} T{teller_id[-4:]}", f"{fatigue:.0%}")
     
     # Logs
     st.markdown("### 📋 Logs")
@@ -639,9 +725,18 @@ def main():
                 for action, count in counts.most_common():
                     st.write(f"- {action}: {count}")
     
-    # Auto-refresh
+    
+    # Auto-refresh while running
     if data['is_running']:
-        time.sleep(0.5)
+        time.sleep(0.8)  # Refresh every 800ms
+        st.rerun()
+    
+    # One final refresh after completion to show results
+    elif data.get('is_complete') and not data.get('_completion_shown'):
+        # Mark as shown to prevent infinite refresh
+        data['_completion_shown'] = True
+        save_state(data)
+        time.sleep(0.3)
         st.rerun()
 
 

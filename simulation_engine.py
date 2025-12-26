@@ -65,7 +65,7 @@ W_REF = 5.0
 BASE_SERVICE_TIME = 3.0
 
 # Fatigue parameters
-FATIGUE_ACCUMULATION_RATE = 0.01  # Per minute of service
+FATIGUE_ACCUMULATION_RATE = 0.05  # Per minute of service (increased from 0.01 for faster accumulation)
 MAX_FATIGUE = 1.0
 FATIGUE_EFFICIENCY_IMPACT = 0.6  # Max efficiency loss at fatigue=1
 

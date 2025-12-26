@@ -58,22 +58,35 @@ logger = logging.getLogger(__name__)
 # Reference values for normalization
 W_REF = 5.0  # Reference wait time (minutes)
 
-# Cost weights (tunable hyperparameters)
-# Balanced for BOTH good service AND cost control
-C_LABOR = 8.0       # Higher labor cost = scales down faster after rush
-C_WAIT = 30.0       # High wait cost = responds quickly to queues
-C_BURNOUT = 50.0    # Cost per burnt-out teller (highest!)
+# Cost weights (MPC Objective Function - AGGRESSIVE SERVICE)
+C_LABOR = 5.0       # slashed from 15.0 to prioritize service over cost
+C_WAIT = 20.0       # quadrupled from 5.0 to severely penalize any wait
+C_BURNOUT = 50.0    # Cost per burnt-out teller
+C_SWITCH = 1.0      # Reduced damping to allow rapid scaling
 
-# Emergency thresholds - balanced for responsiveness
-QUEUE_EMERGENCY_THRESHOLD = 12  # Force ADD_TELLER above this  
-QUEUE_HIGH_THRESHOLD = 8        # Block DELAY/REMOVE above this  
-QUEUE_LOW_THRESHOLD = 3         # Allow REMOVE below this to save costs
+# Resource Constraints
+MAX_TELLERS = 20    # Increased cap (was 15) to handle extreme lunch peaks
+
+# MPC Parameters
+MPC_HORIZON = 5     # Look ahead 5 steps (e.g., 10 minutes)
+MPC_DISCOUNT = 0.9  # Future costs are slightly less important
+
+# Emergency thresholds (Safety net, limits MPC search space)
+QUEUE_EMERGENCY_THRESHOLD = 25  # Force max capacity calculation
+QUEUE_LOW_THRESHOLD = 1         # Min capacity calculation
 
 # Decision interval
-DECISION_INTERVAL_MINUTES = 2.0  # Fast response time
+DECISION_INTERVAL_MINUTES = 2.0
 
-# Fluid approximation parameters
-MU_SERVICE = 1.0 / 3.0  # Service rate (customers/minute)
+# START PREVIOUSLY DELETED CONSTANTS NEEDED BY decide() METHOD
+QUEUE_PER_TELLER_ADD = 2.0      # More aggressive add (was 3.0)
+QUEUE_PER_TELLER_REMOVE = 0.5   # Remove teller if queue/tellers < this
+QUEUE_HIGH_THRESHOLD = 15       # Don't remove if queue > 15
+# END RESTORED CONSTANTS
+
+# Queue Dynamics Model
+# Service rate mu (customers/minute/teller)
+MU_SERVICE = 1.0 / 3.0  # 3 minutes per customer -> 0.33 cust/min
 
 
 # =============================================================================
@@ -377,123 +390,354 @@ class OptimizationAgent:
             return None
         return max(state.teller_fatigue, key=state.teller_fatigue.get)
         
-    def decide(self, state: SystemState) -> Tuple[Action, Dict]:
+    def _predict_state(self, current_queue: float, num_tellers: int, arrival_rate: float) -> Tuple[float, float]:
         """
-        Make staffing decision based on current state.
+        Simulate queue evolution for one time step.
+        Returns: (next_queue, wait_time)
+        """
+        capacity = max(1, num_tellers) * MU_SERVICE * DECISION_INTERVAL_MINUTES
+        arrivals = arrival_rate * DECISION_INTERVAL_MINUTES
         
-        Algorithm:
-        1. If delay is active, continue waiting
-        2. Evaluate cost for each possible action
-        3. Select minimum cost action
-        4. Record decision for audit trail
+        # Queue dynamics: Q_next = max(0, Q_curr + arrivals - capacity)
+        next_queue = max(0.0, current_queue + arrivals - capacity)
         
-        Returns:
-            (action, command_dict)
+        # Wait estimation (Little's Law approximation)
+        effective_capacity = max(1, num_tellers) * MU_SERVICE
+        wait_time = next_queue / max(0.1, effective_capacity)
+        
+        return next_queue, wait_time
+
+    def _optimize_horizon(self, state: SystemState) -> Tuple[Action, CostBreakdown]:
+        """
+        Model Predictive Control: Evaluate actions over a future horizon.
+        """
+        best_initial_action = Action.DO_NOTHING
+        min_cumulative_cost = float('inf')
+        best_breakdown = None  # Store cost breakdown for logging
+        
+        # Simplification: Assume arrival rate is constant over horizon (Zero-Order Hold)
+        # In a full system, we'd query forecaster for t+1, t+2...
+        arrival_rate = state.predicted_arrivals_ucb / DECISION_INTERVAL_MINUTES
+        
+        # Explore initial actions (Beam Search width 1)
+        # We only branch on the first step, then assume "DO_NOTHING" (keep level) for the rest
+        # This is a standard simplified control strategy
+        candidates = [Action.DO_NOTHING, Action.ADD_TELLER, Action.REMOVE_TELLER]
+        
+        # Add GIVE_BREAK if applicable
+        target_teller = self._get_most_fatigued_teller(state)
+        fatigue = state.teller_fatigue.get(target_teller, 0) if target_teller is not None else 0
+        if target_teller is not None and fatigue > 0.6:
+            candidates.append(Action.GIVE_BREAK)
+            
+        for action in candidates:
+            # 1. Apply Initial Action
+            sim_queue = state.current_queue
+            sim_tellers = state.num_tellers
+            cumulative_cost = 0.0
+            
+            # Action logic for first step
+            if action == Action.ADD_TELLER:
+                if sim_tellers >= MAX_TELLERS: continue # Cap resource usage
+                sim_tellers += 1
+                switch_cost = C_SWITCH
+            elif action == Action.REMOVE_TELLER:
+                if sim_tellers <= 3: continue # Constraint
+                sim_tellers -= 1
+                switch_cost = C_SWITCH
+            elif action == Action.GIVE_BREAK:
+                # Temporarily lose 1 teller capacity
+                sim_tellers -= 1 
+                switch_cost = 0 # Breaks are necessary, don't penalize as switching
+                # Bonus: Reset fatigue cost (simplified)
+            else: # DO_NOTHING / DELAY
+                switch_cost = 0
+                
+            cumulative_cost += switch_cost
+            
+            # 2. Simulate Horizon
+            step_breakdown = None
+            
+            for t in range(MPC_HORIZON):
+                # Update State
+                sim_queue, sim_wait = self._predict_state(sim_queue, sim_tellers, arrival_rate)
+                
+                # Calculate Costs (Step t)
+                labor_cost = C_LABOR * sim_tellers
+                wait_cost = C_WAIT * (sim_wait / W_REF)
+                
+                # Burnout cost (static approximation)
+                burnout_cost = self.c_burnout * state.burnt_out_count if t == 0 else 0
+                
+                # Breaking logic adjustment for first step
+                if action == Action.GIVE_BREAK and t == 0:
+                     # Simulate benefit of break (reduced burnout risk)
+                     burnout_cost = 0 
+                
+                step_total = labor_cost + wait_cost + burnout_cost
+                cumulative_cost += step_total * (MPC_DISCOUNT ** t)
+                
+                # Capture first step cost for reporting
+                if t == 0:
+                    step_breakdown = CostBreakdown(
+                        labor_cost=labor_cost,
+                        wait_cost=wait_cost,
+                        burnout_cost=burnout_cost,
+                        total_cost=step_total
+                    )
+            
+            # 3. Select Best
+            if cumulative_cost < min_cumulative_cost:
+                min_cumulative_cost = cumulative_cost
+                best_initial_action = action
+                best_breakdown = step_breakdown
+                
+        return best_initial_action, best_breakdown
+
+    def _decide_traditional(self, state: SystemState) -> Tuple[Action, Dict]:
+        """
+        Traditional Reactive Logic (Baseline).
+        
+        Rules:
+        - If Queue/Teller > 5: Add Teller
+        - If Queue/Teller < 2: Remove Teller
+        - If any teller fatigue > 0.7: Give Break (reactive)
         """
         timestamp = datetime.now().isoformat()
         
-        # Check if we're in delay mode
-        if self.delay_remaining > 0:
-            # EMERGENCY OVERRIDE: Skip delay if queue is critical
-            if state.current_queue >= QUEUE_EMERGENCY_THRESHOLD:
-                self.delay_remaining = 0  # Cancel delay - emergency!
-            else:
-                self.delay_remaining -= 1
-                command = {
-                    "action": Action.DELAY_DECISION.value,
+        # Calculate load metric
+        load_per_teller = state.current_queue / max(1, state.num_tellers)
+        
+        # Check for fatigued tellers needing breaks (reactive)
+        if state.teller_fatigue:
+            for teller_id, fatigue in state.teller_fatigue.items():
+                if fatigue > 0.7 and state.num_tellers > 2:  # Don't give break if too few tellers
+                    return Action.GIVE_BREAK, {
+                        "action": Action.GIVE_BREAK.value,
+                        "reason": f"Reactive: Teller {str(teller_id)[-4:]} fatigue={fatigue:.0%}",
+                        "timestamp": timestamp,
+                        "teller_id": teller_id
+                    }
+        
+        if load_per_teller > 5.0 and state.num_tellers < MAX_TELLERS:
+            return Action.ADD_TELLER, {
+                "action": Action.ADD_TELLER.value,
+                "reason": f"Reactive: Load {load_per_teller:.1f} > 5.0",
+                "timestamp": timestamp
+            }
+            
+        if load_per_teller < 2.0 and state.num_tellers > 3:
+             return Action.REMOVE_TELLER, {
+                "action": Action.REMOVE_TELLER.value,
+                "reason": f"Reactive: Load {load_per_teller:.1f} < 2.0",
+                "timestamp": timestamp
+            }
+            
+        return Action.DO_NOTHING, {
+            "action": Action.DO_NOTHING.value,
+            "reason": "Reactive: Load within normal bounds",
+            "timestamp": timestamp
+        }
+
+    def decide(self, state: SystemState, mode: str = "MPC", scenario_name: str = "FLASH_MOB") -> Tuple[Action, Dict]:
+        """
+        Make staffing decision.
+        mode: "MPC" (AI), "TRADITIONAL" (Reactive), "RL" (DQN), or "HYBRID" (MPC+RL)
+        scenario_name: Name of scenario for loading correct RL model
+        """
+        if mode == "TRADITIONAL":
+            return self._decide_traditional(state)
+            
+        if mode == "RL":
+            return self._decide_rl(state, scenario_name)
+            
+        if mode == "HYBRID":
+            return self._decide_hybrid(state, scenario_name)
+            
+        timestamp = datetime.now().isoformat()
+        
+        # SAFETY OVERRIDES (Constraints outside MPC)
+        if state.current_queue >= QUEUE_EMERGENCY_THRESHOLD:
+             # CRITICAL FIX: Respect MAX_TELLERS even in emergency
+             if state.num_tellers < MAX_TELLERS:
+                 command = {
+                    "action": Action.ADD_TELLER.value,
                     "timestamp": timestamp,
-                    "reason": f"Delay active ({self.delay_remaining} intervals remaining)",
+                    "reason": f"EMERGENCY: Queue={state.current_queue}",
                     "cost_analysis": None
                 }
-                return Action.DELAY_DECISION, command
-        
-        # EMERGENCY: Immediately add teller if queue is critical
-        if state.current_queue >= QUEUE_EMERGENCY_THRESHOLD:
-            command = {
-                "action": Action.ADD_TELLER.value,
-                "timestamp": timestamp,
-                "reason": f"EMERGENCY: Queue={state.current_queue} >= {QUEUE_EMERGENCY_THRESHOLD}",
-                "cost_analysis": None
-            }
-            logger.info(f"🚨 EMERGENCY ADD_TELLER: Queue={state.current_queue}")
-            return Action.ADD_TELLER, command
-        
-        # COST SAVINGS: Remove teller when queue is very low and we have excess
+                 logger.info(f"🚨 EMERGENCY ADD: Queue={state.current_queue}")
+                 return Action.ADD_TELLER, command
+             
         if state.current_queue <= QUEUE_LOW_THRESHOLD and state.num_tellers > 5:
-            command = {
+             command = {
                 "action": Action.REMOVE_TELLER.value,
                 "timestamp": timestamp,
-                "reason": f"COST_SAVINGS: Queue={state.current_queue} <= {QUEUE_LOW_THRESHOLD}, Tellers={state.num_tellers}",
+                "reason": f"LOW LOAD: Queue={state.current_queue}",
                 "cost_analysis": None
             }
-            logger.info(f"💰 COST_SAVINGS REMOVE_TELLER: Queue={state.current_queue}, Tellers={state.num_tellers}")
-            return Action.REMOVE_TELLER, command
-            
-        # Evaluate all actions
-        evaluations: Dict[Action, CostBreakdown] = {}
-        target_teller = self._get_most_fatigued_teller(state)
+             return Action.REMOVE_TELLER, command
+
+        # FATIGUE CHECK - Give breaks to exhausted tellers
+        if state.teller_fatigue and state.num_tellers > 2:
+            for teller_id, fatigue in state.teller_fatigue.items():
+                if fatigue > 0.7:  # 70% fatigue threshold
+                    return Action.GIVE_BREAK, {
+                        "action": Action.GIVE_BREAK.value,
+                        "timestamp": timestamp,
+                        "reason": f"MPC: Teller {str(teller_id)[-4:]} fatigue={fatigue:.0%}",
+                        "cost_analysis": None,
+                        "teller_id": teller_id
+                    }
+
+        # MPC OPTIMIZATION
+        best_action, cost_analysis = self._optimize_horizon(state)
         
-        for action in Action:
-            if action == Action.REMOVE_TELLER and state.num_tellers <= 3:
-                # Keep minimum 3 tellers for adequate service
-                continue
-            # Don't remove tellers if queue is high
-            if action == Action.REMOVE_TELLER and state.current_queue >= QUEUE_HIGH_THRESHOLD:
-                continue
-            if action == Action.GIVE_BREAK and target_teller is None:
-                continue
-            # Don't give breaks if queue is high
-            if action == Action.GIVE_BREAK and state.current_queue >= QUEUE_HIGH_THRESHOLD:
-                continue
-            # Don't delay if queue is building
-            if action == Action.DELAY_DECISION and state.current_queue >= QUEUE_HIGH_THRESHOLD:
-                continue
-                
-            cost = self._calculate_cost(
-                state, action,
-                target_teller if action == Action.GIVE_BREAK else None
-            )
-            evaluations[action] = cost
-            
-        # Find minimum cost action
-        best_action = min(evaluations, key=lambda a: evaluations[a].total_cost)
-        best_cost = evaluations[best_action]
-        
-        # Anti-oscillation: if same action as last time, consider delay
-        if (best_action == self.last_action and 
-            best_action in [Action.ADD_TELLER, Action.REMOVE_TELLER]):
-            # Check if DELAY_DECISION has similar cost
-            if Action.DELAY_DECISION in evaluations:
-                delay_cost = evaluations[Action.DELAY_DECISION]
-                if delay_cost.total_cost <= best_cost.total_cost * 1.1:  # 10% tolerance
-                    best_action = Action.DELAY_DECISION
-                    best_cost = delay_cost
-                    self.delay_remaining = 1
-                    
-        self.last_action = best_action
-        
-        # Build command
         command = {
             "action": best_action.value,
             "timestamp": timestamp,
-            "reason": self._generate_reason(best_action, best_cost, state),
-            "cost_analysis": best_cost.to_dict(),
-            "all_costs": {a.value: c.to_dict() for a, c in evaluations.items()}
+            "reason": f"MPC Optimal (H={MPC_HORIZON})",
+            "cost_analysis": cost_analysis.to_dict() if cost_analysis else None
         }
         
-        # Add teller_id if applicable
-        if best_action == Action.GIVE_BREAK:
-            command["teller_id"] = target_teller
-            
-        # Record for audit
-        self.decision_history.append(command)
+        logger.info(f"🤖 MPC Decision: {best_action.value} (Queue={state.current_queue}, Pred={state.predicted_arrivals_ucb:.1f})")
         
-        # Publish to Kafka
-        if self.kafka_producer:
-            self.kafka_producer.send('bank_commands', command)
-            self.kafka_producer.flush()
-            
         return best_action, command
+
+    def _decide_rl(self, state: SystemState, scenario_name: str = "FLASH_MOB") -> Tuple[Action, Dict]:
+        """Deep Q-Learning Decision."""
+        # Lazy Load Agent (reload if scenario changes)
+        current_model = getattr(self, "_rl_model_name", None)
+        target_model = f"rl_model_{scenario_name}.pth"
+        
+        if not hasattr(self, "rl_agent") or current_model != target_model:
+            try:
+                from rl_agent import DQNAgent
+                # State size must match training (4)
+                self.rl_agent = DQNAgent(input_size=4, action_size=3)
+                # Try loading scenario-specific model
+                try:
+                    self.rl_agent.load(target_model)
+                    self.rl_agent.epsilon = 0.01 # Greedy for inference
+                    self._rl_model_name = target_model
+                    logger.info(f"✓ Loaded RL Model: {scenario_name}")
+                except:
+                    # Fallback to flash_mob model
+                    try:
+                        self.rl_agent.load("rl_model_FLASH_MOB.pth")
+                        self._rl_model_name = "rl_model_FLASH_MOB.pth"
+                        logger.warning(f"⚠ No RL model for {scenario_name}, using FLASH_MOB")
+                    except:
+                        logger.warning("⚠ No RL model found, using untrained agent")
+            except ImportError:
+                 logger.error("Could not import DQNAgent")
+                 return Action.DO_NOTHING, {}
+
+        # Construct State Vector [Queue/50, Tellers/20, Forecast/20, Fatigue]
+        # Must match train_rl.py normalization
+        s_vec = [
+            state.current_queue / 50.0,
+            state.num_tellers / 20.0,
+            state.predicted_arrivals_ucb / 20.0,
+            state.avg_fatigue
+        ]
+        
+        action_idx = self.rl_agent.select_action(s_vec)
+        
+        # Map: 0->DO_NOTHING, 1->ADD, 2->REMOVE
+        action_map = {0: Action.DO_NOTHING, 1: Action.ADD_TELLER, 2: Action.REMOVE_TELLER}
+        best_action = action_map.get(action_idx, Action.DO_NOTHING)
+        
+        # Safety Overrides still apply? Maybe partially.
+        # Let's trust pure RL for now unless physically impossible
+        if best_action == Action.ADD_TELLER and state.num_tellers >= MAX_TELLERS:
+            best_action = Action.DO_NOTHING
+        if best_action == Action.REMOVE_TELLER and state.num_tellers <= 1:
+            best_action = Action.DO_NOTHING
+
+        timestamp = datetime.now().isoformat()
+        command = {
+            "action": best_action.value,
+            "timestamp": timestamp,
+            "reason": f"RL Policy ({scenario_name})",
+            "cost_analysis": None
+        }
+        return best_action, command
+
+    def _decide_hybrid(self, state: SystemState, scenario_name: str = "FLASH_MOB") -> Tuple[Action, Dict]:
+        """
+        HYBRID Decision: Combines MPC and RL intelligently.
+        
+        Strategy:
+        - Use MPC when: queue > 15 OR predicted arrivals > 50 (peak/busy periods)
+        - Use RL when: queue <= 15 AND predicted arrivals <= 50 (low traffic)
+        
+        This combines MPC's forecasting advantage during peaks with 
+        RL's cost efficiency during quiet periods.
+        """
+        # Determine current load level
+        is_peak = (state.current_queue > 15 or 
+                   state.predicted_arrivals_ucb > 50 or
+                   state.lobby_anger > 5.0)
+        
+        timestamp = datetime.now().isoformat()
+        
+        if is_peak:
+            # Use MPC for peak periods (better service)
+            action, cmd = self._decide_mpc_internal(state)
+            cmd["reason"] = f"HYBRID→MPC (Queue={state.current_queue}, Pred={state.predicted_arrivals_ucb:.0f})"
+            logger.info(f"🔀 HYBRID: Peak detected → Using MPC")
+            return action, cmd
+        else:
+            # Use RL for low-traffic periods (cost efficient)
+            action, cmd = self._decide_rl(state, scenario_name)
+            cmd["reason"] = f"HYBRID→RL (Queue={state.current_queue}, Pred={state.predicted_arrivals_ucb:.0f})"
+            logger.info(f"🔀 HYBRID: Low traffic → Using RL")
+            return action, cmd
+    
+    def _decide_mpc_internal(self, state: SystemState) -> Tuple[Action, Dict]:
+        """Internal MPC decision without logging (for hybrid use)."""
+        timestamp = datetime.now().isoformat()
+        
+        # SAFETY OVERRIDES
+        if state.current_queue >= QUEUE_EMERGENCY_THRESHOLD:
+            if state.num_tellers < MAX_TELLERS:
+                return Action.ADD_TELLER, {
+                    "action": Action.ADD_TELLER.value,
+                    "timestamp": timestamp,
+                    "reason": f"EMERGENCY: Queue={state.current_queue}",
+                    "cost_analysis": None
+                }
+                
+        if state.current_queue <= QUEUE_LOW_THRESHOLD and state.num_tellers > 5:
+            return Action.REMOVE_TELLER, {
+                "action": Action.REMOVE_TELLER.value,
+                "timestamp": timestamp,
+                "reason": f"LOW LOAD: Queue={state.current_queue}",
+                "cost_analysis": None
+            }
+
+        # FATIGUE CHECK - Give breaks to exhausted tellers
+        if state.teller_fatigue and state.num_tellers > 2:
+            for teller_id, fatigue in state.teller_fatigue.items():
+                if fatigue > 0.7:  # 70% fatigue threshold
+                    return Action.GIVE_BREAK, {
+                        "action": Action.GIVE_BREAK.value,
+                        "timestamp": timestamp,
+                        "reason": f"HYBRID-MPC: Teller {str(teller_id)[-4:]} fatigue={fatigue:.0%}",
+                        "cost_analysis": None,
+                        "teller_id": teller_id
+                    }
+
+        # MPC OPTIMIZATION
+        best_action, cost_analysis = self._optimize_horizon(state)
+        
+        return best_action, {
+            "action": best_action.value,
+            "timestamp": timestamp,
+            "reason": f"MPC Optimal (H={MPC_HORIZON})",
+            "cost_analysis": cost_analysis.to_dict() if cost_analysis else None
+        }
         
     def _generate_reason(
         self,

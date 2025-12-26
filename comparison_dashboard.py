@@ -39,6 +39,7 @@ class Scenario(Enum):
     LUNCH_RUSH = "Lunch Rush"
     PAYDAY = "Payday"
     STRESS_TEST = "Stress Test"
+    FULL_DAY = "Marathon (Full Day)"
 
 SCENARIO_CONFIGS = {
     Scenario.FLASH_MOB: {
@@ -103,6 +104,27 @@ SCENARIO_CONFIGS = {
             {"start": 90, "end": 120, "rate": 100},
         ]
     },
+    Scenario.FULL_DAY: {
+        "name": "Marathon (Full Day)",
+        "description": "12-hour simulation: Morning → Lunch → Evening pushes",
+        "duration": 12.0,       # 12 hours
+        "fixed_tellers": 12,    # High baseline cost
+        "initial_tellers": 4,   # Start lean
+        "schedule": [
+            # Morning Opening (8am-10am)
+            {"start": 0, "end": 120, "rate": 80},  
+            # Morning Lull (10am-11:30am)
+            {"start": 120, "end": 210, "rate": 30},
+            # Lunch Peak (11:30am-2pm) - HIGH STRESS
+            {"start": 210, "end": 360, "rate": 150},
+            # Afternoon Lull (2pm-4pm)
+            {"start": 360, "end": 480, "rate": 40},
+            # Closing Rush (4pm-6pm)
+            {"start": 480, "end": 600, "rate": 100},
+            # After Hours (6pm-8pm)
+            {"start": 600, "end": 720, "rate": 10},
+        ]
+    },
 }
 
 
@@ -132,18 +154,51 @@ def get_default_state(system_type: str):
     }
 
 
+import filelock  # Add to imports at top
+
+# Thread-safe file operations
+_file_locks = {}
+
+def get_file_lock(state_file):
+    lock_path = str(state_file) + ".lock"
+    if lock_path not in _file_locks:
+        try:
+            from filelock import FileLock
+            _file_locks[lock_path] = FileLock(lock_path, timeout=5)
+        except ImportError:
+            # Fallback if filelock not installed
+            class DummyLock:
+                def __enter__(self): return self
+                def __exit__(self, *args): pass
+            _file_locks[lock_path] = DummyLock()
+    return _file_locks[lock_path]
+
+
 def save_state(data, state_file):
-    with open(state_file, 'w') as f:
-        json.dump(data, f)
+    """Save state with retry logic"""
+    for attempt in range(3):
+        try:
+            with open(state_file, 'w') as f:
+                json.dump(data, f)
+            return True
+        except Exception as e:
+            time.sleep(0.1)
+    return False
 
 
 def load_state(state_file, system_type):
-    try:
-        if state_file.exists():
-            with open(state_file, 'r') as f:
-                return json.load(f)
-    except:
-        pass
+    """Load state with retry logic"""
+    for attempt in range(3):
+        try:
+            if state_file.exists():
+                with open(state_file, 'r') as f:
+                    content = f.read()
+                    if content.strip():  # Only parse if file has content
+                        data = json.loads(content)
+                        if data.get('time_points'):  # Ensure it's valid data
+                            return data
+        except Exception as e:
+            time.sleep(0.1)
     return get_default_state(system_type)
 
 
@@ -171,8 +226,10 @@ def run_traditional_simulation(scenario: Scenario, speed: float):
     data = load_state(STATE_FILE_TRAD, "Traditional")
     data['is_running'] = True
     
+    # Use SEPARATE RandomState for thread safety (same seed = same arrivals)
+    rng = np.random.RandomState(42)
+    
     # Initialize simulation with FIXED teller count
-    np.random.seed(42)
     simulation = AffectiveSimulationEngine(
         num_tellers=config['fixed_tellers'],
         seed=42
@@ -195,23 +252,30 @@ def run_traditional_simulation(scenario: Scenario, speed: float):
     while sim_time < duration_minutes and not should_stop():
         current_rate = get_rate(sim_time)
         
-        # Generate arrivals
+        # Generate arrivals using LOCAL random state
         expected = current_rate * (decision_interval / 60)
-        actual_arrivals = np.random.poisson(expected)
+        actual_arrivals = rng.poisson(expected)
         
         for _ in range(actual_arrivals):
             import uuid
             customer = Customer(
                 customer_id=str(uuid.uuid4())[:8],
                 arrival_time=simulation.env.now,
-                patience_limit=np.random.exponential(25),
-                task_complexity=np.clip(np.random.exponential(0.8), 0.3, 2.0),
-                contagion_factor=np.random.beta(2, 8)
+                patience_limit=rng.exponential(25),
+                task_complexity=np.clip(rng.exponential(0.8), 0.3, 2.0),
+                contagion_factor=rng.beta(2, 8)
             )
             simulation.add_customer(customer)
         
         # Step simulation - NO OPTIMIZER, fixed tellers
         simulation.env.run(until=simulation.env.now + decision_interval)
+        
+        # TRADITIONAL: Mandatory breaks when tellers are fatigued (realistic constraint)
+        # Tellers in traditional system still get tired and need breaks
+        for teller in simulation.tellers:
+            # If teller is very fatigued (>0.75) and not on break, force a break
+            if teller.fatigue > 0.75 and not teller.on_break:
+                simulation.give_teller_break(teller.teller_id, 5.0)  # 5 min break
         
         # Update state
         time_str = f"{int(9 + sim_time/60):02d}:{int(sim_time%60):02d}"
@@ -261,8 +325,10 @@ def run_dynamic_simulation(scenario: Scenario, speed: float):
     data = load_state(STATE_FILE_DYN, "Dynamic (Ours)")
     data['is_running'] = True
     
+    # Use SEPARATE RandomState for thread safety (same seed = same arrivals as Traditional)
+    rng = np.random.RandomState(42)
+    
     # Initialize simulation
-    np.random.seed(42)  # Same seed for fair comparison
     simulation = AffectiveSimulationEngine(
         num_tellers=config['initial_tellers'],
         seed=42
@@ -293,18 +359,18 @@ def run_dynamic_simulation(scenario: Scenario, speed: float):
     while sim_time < duration_minutes and not should_stop():
         current_rate = get_rate(sim_time)
         
-        # Generate arrivals (same as traditional)
+        # Generate arrivals using LOCAL random state (same as Traditional)
         expected = current_rate * (decision_interval / 60)
-        actual_arrivals = np.random.poisson(expected)
+        actual_arrivals = rng.poisson(expected)
         
         for _ in range(actual_arrivals):
             import uuid
             customer = Customer(
                 customer_id=str(uuid.uuid4())[:8],
                 arrival_time=simulation.env.now,
-                patience_limit=np.random.exponential(25),
-                task_complexity=np.clip(np.random.exponential(0.8), 0.3, 2.0),
-                contagion_factor=np.random.beta(2, 8)
+                patience_limit=rng.exponential(25),
+                task_complexity=np.clip(rng.exponential(0.8), 0.3, 2.0),
+                contagion_factor=rng.beta(2, 8)
             )
             simulation.add_customer(customer)
         
@@ -435,8 +501,8 @@ def create_comparison_chart(trad_data, dyn_data, metric='queue_lengths', title="
     
     if trad_data.get('time_points') and trad_metric:
         fig.add_trace(go.Scatter(
-            x=trad_data['time_points'][-40:],
-            y=trad_metric[-40:],
+            x=trad_data['time_points'][-500:],
+            y=trad_metric[-500:],
             name='Traditional (Fixed)',
             line=dict(color='#FF6B6B', width=3),
             mode='lines+markers'
@@ -444,11 +510,11 @@ def create_comparison_chart(trad_data, dyn_data, metric='queue_lengths', title="
     
     if dyn_data.get('time_points') and dyn_metric:
         fig.add_trace(go.Scatter(
-            x=dyn_data['time_points'][-40:],
-            y=dyn_metric[-40:],
+            x=dyn_data['time_points'][-500:],
+            y=dyn_metric[-500:],
             name='Dynamic (Ours)',
             line=dict(color='#4ECDC4', width=3),
-            mode='lines+markers'
+            mode='lines'
         ))
     
     fig.update_layout(

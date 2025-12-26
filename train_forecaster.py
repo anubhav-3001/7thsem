@@ -1,196 +1,193 @@
 """
-Train the Bayesian LSTM Forecaster
-===================================
-
-This script generates synthetic bank arrival data and trains the LSTM model
-to predict future arrivals with uncertainty quantification.
-
-Usage:
-    python train_forecaster.py
-    
-After training, the model weights are saved to 'forecaster_weights.pth'
-and can be loaded in main.py for live predictions.
+Script to train the Bayesian Forecaster on specific scenarios.
 """
-
+import argparse
+import logging
 import numpy as np
 import torch
-import json
-from datetime import datetime, timedelta
-from typing import List, Tuple
+import pandas as pd
+from typing import List, Dict, Tuple
 
-from forecaster import (
-    BayesianLSTM, 
-    BayesianForecaster,
-    create_training_data, 
-    train_model
-)
+from forecaster import BayesianForecaster, BayesianLSTM, create_training_data, train_model
+from run_scenario import SCENARIOS, Scenario
 
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
+logger = logging.getLogger(__name__)
 
-def generate_synthetic_bank_data(
-    num_days: int = 30,
-    intervals_per_day: int = 96  # 15-minute intervals
-) -> Tuple[List[int], List[int], List[int], List[float]]:
+def generate_synthetic_data(scenario_name: str, days: int = 30) -> Dict[str, List]:
     """
-    Generate realistic synthetic bank arrival data.
-    
-    Models:
-    - Time-of-day patterns (morning ramp, lunch peak, afternoon decline)
-    - Day-of-week effects (Mon/Fri busier)
-    - Random noise
-    
-    Returns:
-        arrivals, hours, days, anger_scores
+    Generate synthetic training data based on a scenario's arrival schedule.
     """
-    np.random.seed(42)
+    if scenario_name not in Scenario.__members__:
+        raise ValueError(f"Unknown scenario: {scenario_name}")
+        
+    scenario_enum = Scenario[scenario_name]
+    config = SCENARIOS[scenario_enum]
+    
+    # logger.info(f"Generating {days} days of data for scenario: {config.name}")
     
     arrivals = []
     hours = []
-    days = []
+    days_list = []
     anger_scores = []
     
-    for day in range(num_days):
-        day_of_week = day % 7  # 0=Monday
+    for day in range(days):
+        day_of_week = day % 7
+        duration_minutes = int(config.duration_hours * 60)
+        step = 5 # minutes
         
-        for interval in range(intervals_per_day):
-            # Convert interval to hour (0-23)
-            hour = (interval * 15) // 60  # 15-min intervals
-            minute_frac = (interval * 15) % 60 / 60
-            hour_float = hour + minute_frac
+        # Scenario Timeline
+        for t in range(0, duration_minutes, step):
+            rate = 5.0 # default
+            for period in config.arrival_schedule:
+                if period["start"] <= t < period["end"]:
+                    rate = period["rate"]
+                    break
             
-            # Base arrival rate based on time of day
-            if 9 <= hour_float < 11:
-                # Morning ramp-up
-                base_rate = 10 + 20 * (hour_float - 9) / 2
-            elif 11 <= hour_float < 13:
-                # Lunch rush
-                base_rate = 60
-            elif 13 <= hour_float < 15:
-                # Post-lunch decline
-                base_rate = 60 - 40 * (hour_float - 13) / 2
-            elif 15 <= hour_float < 17:
-                # Late afternoon
-                base_rate = 15
-            else:
-                # Off-hours
-                base_rate = 5
+            # Convert hourly rate to interval rate
+            obs_arrivals = np.random.poisson(rate * (step / 60))
             
-            # Day-of-week effect (Monday/Friday 20% busier)
-            if day_of_week in [0, 4]:  # Monday, Friday
-                base_rate *= 1.2
-            elif day_of_week == 6:  # Sunday (closed or minimal)
-                base_rate *= 0.3
+            # Time of day: Start at 9:00 AM
+            current_hour = 9 + int(t / 60)
             
-            # Convert hourly rate to 15-minute interval
-            interval_rate = base_rate / 4
+            # Anger: correlates with load (heuristic for training)
+            base_anger = 1.0 + (obs_arrivals / 20.0) 
+            anger = np.clip(np.random.normal(base_anger, 0.5), 0, 10)
             
-            # Generate Poisson arrivals
-            arrivals_count = np.random.poisson(interval_rate)
-            arrivals.append(arrivals_count)
-            hours.append(hour)
-            days.append(day_of_week)
-            
-            # Anger correlates with arrivals (more crowded = more angry)
-            base_anger = min(arrivals_count / 5, 8)
-            anger = np.clip(base_anger + np.random.normal(0, 1), 0, 10)
+            arrivals.append(obs_arrivals)
+            hours.append(current_hour)
+            days_list.append(day_of_week)
             anger_scores.append(anger)
-    
-    return arrivals, hours, days, anger_scores
+            
+    return {
+        "arrivals": arrivals,
+        "hours": hours,
+        "days": days_list,
+        "anger_scores": anger_scores
+    }
 
-
-def main():
-    print("=" * 60)
-    print("Training Bayesian LSTM Forecaster")
-    print("=" * 60)
-    
-    # Generate synthetic training data
-    print("\n📊 Generating synthetic bank arrival data (30 days)...")
-    arrivals, hours, days, anger_scores = generate_synthetic_bank_data(num_days=30)
-    print(f"   Generated {len(arrivals)} data points")
-    print(f"   Avg arrivals per interval: {np.mean(arrivals):.2f}")
-    print(f"   Max arrivals: {max(arrivals)}")
-    
-    # Create training sequences
-    print("\n🔧 Creating training sequences...")
-    sequence_length = 10  # Match the FORECASTER_SEQUENCE_LEN in main.py
-    X, y = create_training_data(arrivals, hours, days, anger_scores, sequence_length)
-    print(f"   Training samples: {X.shape[0]}")
-    print(f"   Sequence length: {X.shape[1]}")
-    print(f"   Features: {X.shape[2]}")
-    
-    # Split into train/validation
-    split_idx = int(0.8 * len(X))
-    X_train, X_val = X[:split_idx], X[split_idx:]
-    y_train, y_val = y[:split_idx], y[split_idx:]
-    print(f"   Train samples: {len(X_train)}, Validation samples: {len(X_val)}")
-    
-    # Initialize model
-    print("\n🧠 Initializing Bayesian LSTM...")
-    model = BayesianLSTM(
-        input_size=4,
-        hidden_size=64,
-        num_layers=2,
-        dropout_prob=0.3
-    )
-    
-    # Count parameters
-    total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"   Total parameters: {total_params:,}")
-    print(f"   Trainable parameters: {trainable_params:,}")
-    
-    # Train
-    print("\n🚀 Training model (100 epochs)...")
-    print("-" * 40)
-    losses = train_model(
-        model=model,
-        X=X_train,
-        y=y_train,
-        epochs=100,
-        learning_rate=0.001,
-        batch_size=32
-    )
-    print("-" * 40)
-    
-    # Validate
-    print("\n📈 Validation...")
+def evaluate_model(model: BayesianLSTM, X_test: torch.Tensor, y_test: torch.Tensor) -> Dict[str, float]:
+    """Evaluate model performance on test set."""
     model.eval()
     with torch.no_grad():
-        val_predictions = model(X_val)
-        val_loss = torch.nn.MSELoss()(val_predictions, y_val)
-        print(f"   Validation MSE: {val_loss.item():.4f}")
-        print(f"   Validation RMSE: {np.sqrt(val_loss.item()):.4f}")
+        # Get point predictions (mean of distribution)
+        # For evaluation, we can just do one pass with dropout disabled? 
+        # No, BayesianLSTM relies on dropout for prediction too usually (MC dropout).
+        # But for "goodness of fit" let's check the deterministic output or mean of MC.
+        
+        # Let's do 20 samples MC dropout 
+        preds = []
+        for _ in range(20):
+            preds.append(model(X_test).numpy())
+        
+        preds = np.mean(np.array(preds), axis=0) # (test_size, 1)
+        
+    y_true = y_test.numpy()
     
-    # Save model weights
-    weights_path = "forecaster_weights.pth"
-    torch.save(model.state_dict(), weights_path)
-    print(f"\n💾 Model saved to: {weights_path}")
+    mse = np.mean((preds - y_true) ** 2)
+    rmse = np.sqrt(mse)
+    mae = np.mean(np.abs(preds - y_true))
     
-    # Test uncertainty quantification
-    print("\n🎯 Testing uncertainty quantification...")
-    forecaster = BayesianForecaster(model=model, sequence_length=sequence_length)
-    
-    # Feed last sequence_length observations
-    for i in range(-sequence_length, 0):
-        forecaster.update_history({
-            "arrivals": arrivals[i],
-            "hour": hours[i],
-            "day": days[i],
-            "avg_anger": anger_scores[i]
-        })
-    
-    # Get prediction
-    result = forecaster.predict_with_uncertainty(num_samples=100)
-    print(f"\n   Sample Prediction:")
-    print(f"   Mean: {result['mean']:.2f}")
-    print(f"   Std (uncertainty): {result['std']:.2f}")
-    print(f"   UCB (95%): {result['ucb']:.2f}")
-    
-    print("\n" + "=" * 60)
-    print("✅ Training complete! The model is ready for use.")
-    print("=" * 60)
-    print("\nTo use in main.py, add this after forecaster initialization:")
-    print("    forecaster.load_model('forecaster_weights.pth')")
+    return {"RMSE": rmse, "MAE": mae}
 
+def train_and_evaluate(scenario: str, epochs: int, days: int) -> Dict:
+    """Train and evaluate a single scenario."""
+    
+    # 1. Generate Data
+    data = generate_synthetic_data(scenario, days)
+    
+    X, y = create_training_data(
+        data["arrivals"], 
+        data["hours"], 
+        data["days"], 
+        data["anger_scores"],
+        sequence_length=10
+    )
+    
+    # 2. Split Train/Test (80/20)
+    split_idx = int(0.8 * len(X))
+    X_train, X_test = X[:split_idx], X[split_idx:]
+    y_train, y_test = y[:split_idx], y[split_idx:]
+    
+    # Initialize Model (uses new default hidden_size=128 from forecaster.py)
+    model = BayesianLSTM(input_size=4, hidden_size=128, num_layers=2, dropout_prob=0.3)
+    
+    # Optimizer & Scheduler
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.01) # Start with higher LR
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5, verbose=True)
+    criterion = torch.nn.MSELoss()
+    
+    model.train()
+    best_loss = float('inf')
+    
+    for epoch in range(epochs):
+        optimizer.zero_grad()
+        out = model(X_train)
+        loss = criterion(out, y_train)
+        loss.backward()
+        optimizer.step()
+        
+        # Validation for scheduler
+        model.eval()
+        with torch.no_grad():
+            val_out = model(X_test)
+            val_loss = criterion(val_out, y_test)
+        model.train()
+        
+        scheduler.step(val_loss)
+        
+        if (epoch+1) % 10 == 0:
+            # logger.info(f"Epoch {epoch+1}/{epochs} | Train Loss: {loss.item():.4f} | Val Loss: {val_loss.item():.4f}")
+            pass
+            
+    # 4. Evaluate
+    metrics = evaluate_model(model, X_test, y_test)
+    
+    # 5. Save
+    filename = f"forecaster_weights_{scenario.lower()}.pth"
+    torch.save(model.state_dict(), filename)
+    
+    return {
+        "Scenario": scenario,
+        "Final Loss": loss.item(),
+        "RMSE": metrics["RMSE"],
+        "MAE": metrics["MAE"],
+        "Saved To": filename
+    }
+
+def main():
+    parser = argparse.ArgumentParser(description="Train Forecaster for scenarios")
+    parser.add_argument("--scenario", type=str, help="Scenario name (e.g., FLASH_MOB)")
+    parser.add_argument("--all", action="store_true", help="Train all scenarios")
+    parser.add_argument("--epochs", type=int, default=100, help="Training epochs")  # Increased default
+    parser.add_argument("--days", type=int, default=200, help="Days of synthetic data") # Increased default
+    
+    args = parser.parse_args()
+    
+    if args.all:
+        scenarios_to_run = [s.name for s in Scenario]
+    elif args.scenario:
+        scenarios_to_run = [args.scenario]
+    else:
+        print("Please specify --scenario or --all")
+        return
+
+    results = []
+    logger.info(f"Starting training for {len(scenarios_to_run)} scenarios...")
+    
+    for s in scenarios_to_run:
+        logger.info(f"Training {s}...")
+        res = train_and_evaluate(s, args.epochs, args.days)
+        results.append(res)
+        logger.info(f"  -> RMSE: {res['RMSE']:.2f}")
+
+    # Print Report
+    df = pd.DataFrame(results)
+    print("\n" + "="*60)
+    print("MODEL PERFORMANCE REPORT")
+    print("="*60)
+    print(df[["Scenario", "RMSE", "MAE", "Saved To"]].to_string(index=False))
+    print("="*60)
 
 if __name__ == "__main__":
     main()
